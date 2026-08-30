@@ -19,10 +19,10 @@ app.use(express.urlencoded({ extended: true }));
 // 2. DATABASE CONNECTION POOL
 // ==========================================
 const db = mysql.createPool({
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME,
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'legal_saas',
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
@@ -31,7 +31,7 @@ const db = mysql.createPool({
 // ==========================================
 // 3. UTILITY FUNCTIONS
 // ==========================================
-// Generates MD5 signature for PayFast security
+// Generates MD5 signature for PayFast authentication
 function generateSignature(payload) {
     const params = new URLSearchParams();
     for (const key in payload) {
@@ -46,7 +46,7 @@ function generateSignature(payload) {
 // ==========================================
 // 4. CUSTOM MIDDLEWARES
 // ==========================================
-// Verifies JWT token and logs the user in
+// Verifies JWT token on incoming requests
 const requireAuth = (req, res, next) => {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -54,26 +54,39 @@ const requireAuth = (req, res, next) => {
     }
     const token = authHeader.split(' ')[1];
     try {
-        req.user = jwt.verify(token, process.env.JWT_SECRET);
+        req.user = jwt.verify(token, process.env.JWT_SECRET || 'super_secret_key');
         next();
     } catch (error) {
         return res.status(401).json({ error: "Invalid or expired token." });
     }
 };
 
-// Blocks access if the 2-day trial is over and they haven't paid
+// Checks 2-day free trial or active subscription status
 const checkSubscriptionGuard = async (req, res, next) => {
-    const [rows] = await db.execute('SELECT trial_ends_at, subscription_status FROM lawyers WHERE id = ?', [req.user.id]);
-    const lawyer = rows[0];
-    const now = new Date();
-    
-    if (lawyer.subscription_status === 'active') return next();
-    if (lawyer.subscription_status === 'trial' && new Date(lawyer.trial_ends_at) > now) return next();
-    
-    return res.status(403).json({ 
-        error: "Your 2-day free trial has expired.",
-        subscribe_url: "/api/billing/checkout"
-    });
+    try {
+        const [rows] = await db.execute('SELECT email, trial_ends_at, subscription_status FROM lawyers WHERE id = ?', [req.user.id]);
+        if (rows.length === 0) return res.status(404).json({ error: "User not found." });
+
+        const lawyer = rows[0];
+        const now = new Date();
+
+        // Lifetime admin account bypass OR active subscriber
+        if (lawyer.email.toLowerCase() === 'tebogoanthony455@gmail.com' || lawyer.subscription_status === 'active') {
+            return next();
+        }
+
+        // Active 2-day trial check
+        if (lawyer.subscription_status === 'trial' && new Date(lawyer.trial_ends_at) > now) {
+            return next();
+        }
+
+        return res.status(403).json({
+            error: "Your 2-day free trial has expired.",
+            subscribe_url: "/api/billing/checkout"
+        });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
 };
 
 // ==========================================
@@ -81,18 +94,31 @@ const checkSubscriptionGuard = async (req, res, next) => {
 // ==========================================
 app.post('/api/register', async (req, res) => {
     const { firmName, email, password } = req.body;
-    
-    // Calculate exact date 2 days from now for the free trial
+
+    // Check for Lifetime Free Admin account bypass
+    const isLifetimeAdmin = email.trim().toLowerCase() === 'tebogoanthony455@gmail.com';
+
     const trialEndsAt = new Date();
-    trialEndsAt.setDate(trialEndsAt.getDate() + 2);
-    
+    if (isLifetimeAdmin) {
+        trialEndsAt.setFullYear(2099); // Year 2099 expiration
+    } else {
+        trialEndsAt.setDate(trialEndsAt.getDate() + 2); // Standard 2-day trial
+    }
+
+    const initialStatus = isLifetimeAdmin ? 'active' : 'trial';
+
     try {
         const passwordHash = await bcrypt.hash(password, 10);
         await db.execute(
-            'INSERT INTO lawyers (firm_name, email, password_hash, trial_ends_at) VALUES (?, ?, ?, ?)',
-            [firmName, email, passwordHash, trialEndsAt]
+            'INSERT INTO lawyers (firm_name, email, password_hash, trial_ends_at, subscription_status) VALUES (?, ?, ?, ?, ?)',
+            [firmName, email, passwordHash, trialEndsAt, initialStatus]
         );
-        res.status(201).json({ message: "Account created. 2-day free trial activated." });
+
+        res.status(201).json({
+            message: isLifetimeAdmin
+                ? "Lifetime Admin Account Created & Activated."
+                : "Account created. 2-day free trial activated."
+        });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -103,13 +129,22 @@ app.post('/api/login', async (req, res) => {
     try {
         const [users] = await db.execute('SELECT * FROM lawyers WHERE email = ?', [email]);
         const user = users[0];
-        
+
         if (!user || !(await bcrypt.compare(password, user.password_hash))) {
             return res.status(401).json({ error: "Invalid credentials." });
         }
-        
-        const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN });
-        res.json({ message: "Login successful", token });
+
+        const token = jwt.sign(
+            { id: user.id, email: user.email },
+            process.env.JWT_SECRET || 'super_secret_key',
+            { expiresIn: process.env.JWT_EXPIRES_IN || '24h' }
+        );
+
+        res.json({
+            message: "Login successful",
+            token,
+            isLifetimeAdmin: user.email.toLowerCase() === 'tebogoanthony455@gmail.com'
+        });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -118,21 +153,21 @@ app.post('/api/login', async (req, res) => {
 // ==========================================
 // 6. PAYFAST BILLING ROUTES
 // ==========================================
-// Generates the payment link for the R200/month subscription
+// Generates payment checkout URL for non-admin users (R200/month)
 app.get('/api/billing/checkout', requireAuth, (req, res) => {
     const payload = {
         merchant_id: '36897869',
         merchant_key: 'fbmom4obobv6j',
-        return_url: 'https://your-saas.com/dashboard',
-        cancel_url: 'https://your-saas.com/subscribe',
-        notify_url: 'https://your-saas.com/api/billing/itn',
+        return_url: 'https://legal-bb34.onrender.com/dashboard',
+        cancel_url: 'https://legal-bb34.onrender.com/subscribe',
+        notify_url: 'https://legal-bb34.onrender.com/api/billing/itn',
         m_payment_id: req.user.id.toString(),
         amount: '200.00',
         item_name: 'Legal Practice Software - Monthly Subscription',
-        subscription_type: '1',      
+        subscription_type: '1',
         recurring_amount: '200.00',
-        frequency: '3',              
-        cycles: '0'                  
+        frequency: '3',
+        cycles: '0'
     };
 
     payload.signature = generateSignature(payload);
@@ -140,13 +175,13 @@ app.get('/api/billing/checkout', requireAuth, (req, res) => {
     res.json({ checkout_url: `https://www.payfast.co.za/eng/process?${queryString}` });
 });
 
-// Server-to-server webhook that PayFast calls when a payment succeeds
+// Webhook listener called directly by PayFast server upon payment
 app.post('/api/billing/itn', async (req, res) => {
     const itnData = req.body;
     if (itnData.payment_status === 'COMPLETE') {
         const lawyerId = itnData.m_payment_id;
-        const pfToken = itnData.token; 
-        
+        const pfToken = itnData.token;
+
         await db.execute(
             'UPDATE lawyers SET subscription_status = ?, payfast_token = ? WHERE id = ?',
             ['active', pfToken, lawyerId]
@@ -158,16 +193,16 @@ app.post('/api/billing/itn', async (req, res) => {
 // ==========================================
 // 7. PROTECTED LEGAL MODULE ROUTES
 // ==========================================
-// Apply both JWT verification AND the Subscription Guard to all routes below this line
+// Encapsulates all features behind authentication and subscription guards
 app.use('/api/legal', requireAuth, checkSubscriptionGuard);
 
-// Create Client (Checks for basic conflicts)
+// Client Intake & CRM (Conflict Check)
 app.post('/api/legal/clients', async (req, res) => {
     const { fullName } = req.body;
     try {
         const [existing] = await db.execute('SELECT id FROM clients WHERE full_name LIKE ?', [`%${fullName}%`]);
         if (existing.length > 0) return res.status(409).json({ error: "Potential Conflict of Interest detected." });
-        
+
         await db.execute('INSERT INTO clients (lawyer_id, full_name) VALUES (?, ?)', [req.user.id, fullName]);
         res.status(201).json({ message: "Client created and cleared for intake." });
     } catch (error) {
@@ -175,7 +210,7 @@ app.post('/api/legal/clients', async (req, res) => {
     }
 });
 
-// Deposit into Trust Account
+// Trust Accounting & Financial Compliance
 app.post('/api/legal/trust/deposit', async (req, res) => {
     const { matterId, amount } = req.body;
     try {
@@ -186,7 +221,7 @@ app.post('/api/legal/trust/deposit', async (req, res) => {
     }
 });
 
-// Log Billable Time
+// Time Tracking & Expenses
 app.post('/api/legal/time', async (req, res) => {
     const { matterId, hours, rate, description } = req.body;
     try {
@@ -200,8 +235,22 @@ app.post('/api/legal/time', async (req, res) => {
     }
 });
 
+// Matter Dashboard Overview
+app.get('/api/legal/matters/:matterId', async (req, res) => {
+    const { matterId } = req.params;
+    try {
+        const [matterData] = await db.execute('SELECT * FROM matters WHERE id = ? AND lawyer_id = ?', [matterId, req.user.id]);
+        const [trustData] = await db.execute('SELECT * FROM trust_ledgers WHERE matter_id = ?', [matterId]);
+        const [timeData] = await db.execute('SELECT * FROM time_entries WHERE matter_id = ?', [matterId]);
+
+        res.json({ matter: matterData[0] || null, trustLedger: trustData, billables: timeData });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // ==========================================
 // 8. START SERVER
 // ==========================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Legal SaaS Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Legal Practice SaaS Server running on port ${PORT}`));
