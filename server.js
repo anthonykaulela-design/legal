@@ -16,13 +16,18 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ==========================================
-// 2. DATABASE CONNECTION POOL
+// 2. DATABASE CONNECTION POOL (TiDB SSL ENABLED)
 // ==========================================
 const db = mysql.createPool({
-    host: process.env.DB_HOST || 'localhost',
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'legal_saas',
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    port: process.env.DB_PORT || 4000, // Default TiDB port
+    ssl: {
+        minVersion: 'TLSv1.2',
+        rejectUnauthorized: true
+    },
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
@@ -95,12 +100,12 @@ const checkSubscriptionGuard = async (req, res, next) => {
 app.post('/api/register', async (req, res) => {
     const { firmName, email, password } = req.body;
 
-    // Check for Lifetime Free Admin account bypass
+    // Lifetime Free Admin account bypass check
     const isLifetimeAdmin = email.trim().toLowerCase() === 'tebogoanthony455@gmail.com';
 
     const trialEndsAt = new Date();
     if (isLifetimeAdmin) {
-        trialEndsAt.setFullYear(2099); // Year 2099 expiration
+        trialEndsAt.setFullYear(2099); // Expiration set to year 2099
     } else {
         trialEndsAt.setDate(trialEndsAt.getDate() + 2); // Standard 2-day trial
     }
@@ -153,7 +158,6 @@ app.post('/api/login', async (req, res) => {
 // ==========================================
 // 6. PAYFAST BILLING ROUTES
 // ==========================================
-// Generates payment checkout URL for non-admin users (R200/month)
 app.get('/api/billing/checkout', requireAuth, (req, res) => {
     const payload = {
         merchant_id: '36897869',
@@ -175,7 +179,6 @@ app.get('/api/billing/checkout', requireAuth, (req, res) => {
     res.json({ checkout_url: `https://www.payfast.co.za/eng/process?${queryString}` });
 });
 
-// Webhook listener called directly by PayFast server upon payment
 app.post('/api/billing/itn', async (req, res) => {
     const itnData = req.body;
     if (itnData.payment_status === 'COMPLETE') {
@@ -193,10 +196,9 @@ app.post('/api/billing/itn', async (req, res) => {
 // ==========================================
 // 7. PROTECTED LEGAL MODULE ROUTES
 // ==========================================
-// Encapsulates all features behind authentication and subscription guards
 app.use('/api/legal', requireAuth, checkSubscriptionGuard);
 
-// Client Intake & CRM (Conflict Check)
+// Client Intake & CRM
 app.post('/api/legal/clients', async (req, res) => {
     const { fullName } = req.body;
     try {
