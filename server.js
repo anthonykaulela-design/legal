@@ -2,7 +2,7 @@
  * ============================================================================
  * RSA LEGAL PRACTICE MANAGEMENT & AUTOMATED COMPLIANCE SUITE
  * Enterprise Full-Stack Backend Server (Node.js & Express)
- * Target Environment: Render Cloud Deployment & TiDB Serverless Cloud
+ * Target Deployment: Render Cloud Hosting & TiDB Cloud Serverless (MySQL)
  * ============================================================================
  */
 
@@ -14,23 +14,24 @@ const cors = require('cors');
 
 // --- APPLICATION INITIALIZATION & CONFIGURATION ---
 const app = express();
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(cors());
 
-const JWT_SECRET = process.env.JWT_SECRET || 'legal_secret_key_rsa_2026_secure_hash';
+const JWT_SECRET = process.env.JWT_SECRET || 'rsa_legal_practice_management_jwt_secret_key_2026';
 
 /**
- * Robust Database Connection Pool configured specifically for TiDB Cloud Serverless & Render.
+ * Connection Pool configuration targeting TiDB Serverless & MySQL DB instance.
  */
 const pool = mysql.createPool({
     host: process.env.DB_HOST || 'localhost',
     user: process.env.DB_USER || 'root',
     password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'legal_db',
+    database: process.env.DB_NAME || 'legal_saas',
     port: process.env.DB_PORT ? parseInt(process.env.DB_PORT, 10) : 4000,
     waitForConnections: true,
-    connectionLimit: 15,
+    connectionLimit: 20,
     queueLimit: 0,
     enableKeepAlive: true,
     keepAliveInitialDelay: 0,
@@ -39,7 +40,7 @@ const pool = mysql.createPool({
     }
 });
 
-// --- SECURITY & AUTHENTICATION MIDDLEWARE ---
+// --- SECURITY & AUDIT MIDDLEWARE ---
 
 function authenticateToken(req, res, next) {
     const authHeader = req.headers['authorization'];
@@ -66,13 +67,13 @@ function auditLogger(req, res, next) {
 
 app.use(auditLogger);
 
-// --- HEALTH CHECK & SYSTEM STATUS ENDPOINTS ---
+// --- HEALTH CHECK & DIAGNOSTICS ENDPOINTS ---
 
 app.get('/', (req, res) => {
     res.status(200).json({
         status: 'online',
-        system: 'RSA Legal Practice Suite Enterprise Backend',
-        version: '4.2.1-production',
+        system: 'RSA Legal Practice Management Suite Enterprise Engine',
+        version: '4.2.5-production',
         environment: process.env.NODE_ENV || 'development',
         timestamp: new Date().toISOString()
     });
@@ -90,7 +91,7 @@ app.get('/api/health', async (req, res) => {
 });
 
 // ============================================================================
-// 1. AUTHENTICATION & LAWYER REGISTRATION SUBSYSTEM
+// 1. LAWYER AUTHENTICATION & PRACTICE REGISTRATION SUBSYSTEM
 // ============================================================================
 
 app.post('/api/register', async (req, res) => {
@@ -162,7 +163,7 @@ app.post('/api/login', async (req, res) => {
         res.status(200).json({ 
             success: true,
             token, 
-            message: 'Authentication successful. Welcome to the RSA Legal Suite.',
+            message: 'Authentication successful. Welcome to the RSA Legal Practice Suite.',
             firmName: lawyer.firm_name
         });
     } catch (err) {
@@ -172,7 +173,7 @@ app.post('/api/login', async (req, res) => {
 });
 
 // ============================================================================
-// 2. EXECUTIVE PRACTICE OVERVIEW & METRICS SUBSYSTEM
+// 2. EXECUTIVE DASHBOARD ANALYTICS & METRICS SUBSYSTEM
 // ============================================================================
 
 app.get('/api/legal/stats', authenticateToken, async (req, res) => {
@@ -190,21 +191,21 @@ app.get('/api/legal/stats', authenticateToken, async (req, res) => {
         );
         
         const [wipRows] = await pool.query(
-            'SELECT SUM(billable_hours * rate_per_hour) as total FROM billable_time WHERE lawyer_id = ?', 
+            'SELECT COALESCE(SUM(billable_hours * rate_per_hour), 0.00) as total FROM billable_time WHERE lawyer_id = ?', 
             [lawyerId]
         );
         
         const [trustRows] = await pool.query(
-            `SELECT SUM(CASE WHEN transaction_type = 'deposit' THEN amount ELSE -amount END) as balance 
+            `SELECT COALESCE(SUM(CASE WHEN transaction_type = 'deposit' THEN amount ELSE -amount END), 0.00) as balance 
              FROM trust_ledgers WHERE lawyer_id = ?`,
             [lawyerId]
         );
 
         res.status(200).json({
-            activeMatters: mattersCountResult[0].count || 0,
-            totalClients: clientsCountResult[0].count || 0,
-            unbilledWip: wipRows[0].total || 0,
-            trustBalance: trustRows[0].balance || 0
+            activeMatters: mattersCountResult[0]?.count || 0,
+            totalClients: clientsCountResult[0]?.count || 0,
+            unbilledWip: parseFloat(wipRows[0]?.total || 0),
+            trustBalance: parseFloat(trustRows[0]?.balance || 0)
         });
     } catch (err) {
         console.error('Stats Retrieval Error:', err);
@@ -262,6 +263,44 @@ app.post('/api/legal/clients', authenticateToken, async (req, res) => {
     }
 });
 
+app.put('/api/legal/clients/:id', authenticateToken, async (req, res) => {
+    try {
+        const clientId = req.params.id;
+        const { fullName, email, phone, idNumber } = req.body;
+
+        const [result] = await pool.query(
+            'UPDATE clients SET full_name = ?, email = ?, phone = ?, id_number = ? WHERE id = ? AND lawyer_id = ?',
+            [fullName, email, phone, idNumber, clientId, req.user.id]
+        );
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Client record not found or unauthorized update attempt.' });
+        }
+
+        res.status(200).json({ success: true, message: 'Client record updated successfully.' });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to update client details: ' + err.message });
+    }
+});
+
+app.delete('/api/legal/clients/:id', authenticateToken, async (req, res) => {
+    try {
+        const clientId = req.params.id;
+        const [result] = await pool.query(
+            'DELETE FROM clients WHERE id = ? AND lawyer_id = ?',
+            [clientId, req.user.id]
+        );
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Client record not found or unauthorized deletion attempt.' });
+        }
+
+        res.status(200).json({ success: true, message: 'Client record removed successfully.' });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to delete client record: ' + err.message });
+    }
+});
+
 // ============================================================================
 // 4. LITIGATION & MATTER MANAGEMENT SUBSYSTEM
 // ============================================================================
@@ -301,6 +340,26 @@ app.post('/api/legal/matters', authenticateToken, async (req, res) => {
         });
     } catch (err) {
         res.status(500).json({ error: 'Failed to create matter entry: ' + err.message });
+    }
+});
+
+app.put('/api/legal/matters/:id', authenticateToken, async (req, res) => {
+    try {
+        const matterId = req.params.id;
+        const { caseNumber, title, court } = req.body;
+
+        const [result] = await pool.query(
+            'UPDATE matters SET case_number = ?, title = ?, court = ? WHERE id = ? AND lawyer_id = ?',
+            [caseNumber, title, court, matterId, req.user.id]
+        );
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Matter record not found or permission denied.' });
+        }
+
+        res.status(200).json({ success: true, message: 'Legal matter updated successfully.' });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to update matter entry: ' + err.message });
     }
 });
 
@@ -360,6 +419,24 @@ app.get('/api/legal/documents/:id/download', authenticateToken, async (req, res)
         res.status(200).json(rows[0]);
     } catch (err) {
         res.status(500).json({ error: 'Failed to retrieve document package: ' + err.message });
+    }
+});
+
+app.delete('/api/legal/documents/:id', authenticateToken, async (req, res) => {
+    try {
+        const documentId = req.params.id;
+        const [result] = await pool.query(
+            'DELETE FROM documents WHERE id = ? AND lawyer_id = ?',
+            [documentId, req.user.id]
+        );
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Document not found or unauthorized removal attempt.' });
+        }
+
+        res.status(200).json({ success: true, message: 'Document successfully purged from vault.' });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to delete document entry: ' + err.message });
     }
 });
 
@@ -524,6 +601,24 @@ app.post('/api/legal/time', authenticateToken, async (req, res) => {
     }
 });
 
+app.delete('/api/legal/time/:id', authenticateToken, async (req, res) => {
+    try {
+        const timeId = req.params.id;
+        const [result] = await pool.query(
+            'DELETE FROM billable_time WHERE id = ? AND lawyer_id = ?',
+            [timeId, req.user.id]
+        );
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Time log entry not found or unauthorized.' });
+        }
+
+        res.status(200).json({ success: true, message: 'Billable hours entry deleted successfully.' });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to delete time log entry: ' + err.message });
+    }
+});
+
 // ============================================================================
 // 10. TRUST ACCOUNTING & LEDGER BALANCES SUBSYSTEM
 // ============================================================================
@@ -613,6 +708,24 @@ app.post('/api/legal/calendar', authenticateToken, async (req, res) => {
     }
 });
 
+app.delete('/api/legal/calendar/:id', authenticateToken, async (req, res) => {
+    try {
+        const deadlineId = req.params.id;
+        const [result] = await pool.query(
+            'DELETE FROM court_deadlines WHERE id = ? AND lawyer_id = ?',
+            [deadlineId, req.user.id]
+        );
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Deadline entry not found or unauthorized.' });
+        }
+
+        res.status(200).json({ success: true, message: 'Court deadline entry deleted.' });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to purge court deadline: ' + err.message });
+    }
+});
+
 // ============================================================================
 // 12. AI LEGAL DRAFTING & CASE ANALYSIS ENGINE
 // ============================================================================
@@ -630,7 +743,7 @@ app.post('/api/legal/ai/analyze', authenticateToken, async (req, res) => {
         if (actionType === 'summarize') {
             output = `=== AI LEGAL CASE SUMMARY ===\n\nInput Context Analysis:\n"${inputText.substring(0, 300)}..."\n\nKey Findings:\n1. Prima facie case established.\n2. Potential liability risks identified.\n3. Recommended next step: File notice of motion within statutory periods.`;
         } else if (actionType === 'affidavit') {
-            output = `IN THE HIGH COURT OF SOUTH AFRICA\nGAUTENG DIVISION, PRETORIA\nCase No: 2026/0099\n\nIn the matter between:\nAPPLICANT AND RESPONDENT\n\nFOUNDING AFFIDAVIT\n\n1. I, the undersigned, do hereby make oath and state:\n\n${inputText}\n\n2. The facts herein contained are within my personal knowledge...`;
+            output = `IN THE HIGH COURT OF SOUTH AFRICA\nGAUTENG DIVISION, PRETORIA\nCase No: 2026/0099\n\nIn the matter between:\nAPPLICANT AND RESPONDENT\n\nFOUNDING AFFIDAVIT\n\n1. I, the undersigned, do hereby make oath and state:\n\n${inputText}\n\n2. The facts herein contained are within my personal knowledge and are to the best of my belief both true and correct...`;
         } else {
             output = `=== RISK & CLAUSE ANALYSIS ===\n\nAnalyzed Text:\n"${inputText}"\n\nAssessment: Complies with standard contractual terms and statutory requirements under South African law.`;
         }
@@ -653,7 +766,7 @@ app.post('/api/legal/ai/analyze', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
-// 13. GLOBAL ERROR CATCH-ALL & SERVER LISTENER BINDING
+// 13. GLOBAL ERROR CATCH-ALL & SERVER BINDING
 // ============================================================================
 
 app.use((req, res) => {
@@ -668,7 +781,7 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log(`============================================================`);
-    console.log(`RSA Legal Practice Suite Enterprise Server running on port ${PORT}`);
-    console.log(`Ready to process database transactions with TLS/SSL tunnel.`);
+    console.log(`RSA Legal Practice Suite Backend Engine running on port ${PORT}`);
+    console.log(`Ready to process database transactions with TLS/SSL active.`);
     console.log(`============================================================`);
 });
