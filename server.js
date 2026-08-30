@@ -2,59 +2,193 @@ require('dotenv').config();
 const express = require('express');
 const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
-const jwt = require('jwt-simple');
+const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const crypto = require('crypto');
 
 const app = express();
 
-// Enable CORS and raw body parsing for PayFast webhook validation
+// Middleware
 app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// --- DATABASE CONNECTION (TiDB Cloud / MySQL) ---
+// --- ENVIRONMENT VARIABLES ---
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_legal_suite_key_2026_production';
+const PAYFAST_PASSPHRASE = process.env.PAYFAST_PASSPHRASE || '';
+const PAYFAST_MERCHANT_ID = process.env.PAYFAST_MERCHANT_ID || '10000100'; // Sandbox default
+const PAYFAST_MERCHANT_KEY = process.env.PAYFAST_MERCHANT_KEY || '46f0cd435f439'; // Sandbox default
+const PAYFAST_URL = process.env.PAYFAST_URL || 'https://sandbox.payfast.co.za/eng/process';
+const APP_FRONTEND_URL = process.env.APP_FRONTEND_URL || 'https://your-frontend-domain.com';
+const APP_BACKEND_URL = process.env.APP_BACKEND_URL || 'https://legal-bb34.onrender.com';
+
+// --- DATABASE CONNECTION POOL (TiDB / MySQL) ---
 const db = mysql.createPool({
     host: process.env.TIDB_HOST,
     port: process.env.TIDB_PORT || 4000,
     user: process.env.TIDB_USER,
     password: process.env.TIDB_PASSWORD,
     database: process.env.TIDB_DATABASE,
-    ssl: { rejectUnauthorized: true }
+    ssl: { rejectUnauthorized: true },
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_legal_suite_key_2026';
-const PAYFAST_PASSPHRASE = process.env.PAYFAST_PASSPHRASE || '';
-const PAYFAST_MERCHANT_ID = process.env.PAYFAST_MERCHANT_ID || '10000100'; // Sandbox ID default
-const PAYFAST_MERCHANT_KEY = process.env.PAYFAST_MERCHANT_KEY || '46f0cd435f439'; // Sandbox Key default
-const PAYFAST_URL = process.env.PAYFAST_URL || 'https://sandbox.payfast.co.za/eng/process';
+// --- AUTOMATED DATABASE SCHEMA INITIALIZATION ---
+async function initializeDatabase() {
+    try {
+        const connection = await db.getConnection();
+        console.log('⚡ Connected to TiDB Database. Syncing schema...');
 
-// --- AUTHENTICATION MIDDLEWARE ---
+        // 1. Lawyers / Users Table
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS lawyers (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                firm_name VARCHAR(255) NOT NULL,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                password VARCHAR(255) NOT NULL,
+                is_paid TINYINT(1) DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        // 2. Clients Table
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS clients (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                lawyer_id INT NOT NULL,
+                full_name VARCHAR(255) NOT NULL,
+                email VARCHAR(255) NOT NULL,
+                phone VARCHAR(50) NOT NULL,
+                id_number VARCHAR(100) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (lawyer_id) REFERENCES lawyers(id) ON DELETE CASCADE
+            );
+        `);
+
+        // 3. Matters Table
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS matters (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                lawyer_id INT NOT NULL,
+                client_id INT NOT NULL,
+                case_number VARCHAR(100) NOT NULL,
+                title VARCHAR(255) NOT NULL,
+                court VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (lawyer_id) REFERENCES lawyers(id) ON DELETE CASCADE,
+                FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+            );
+        `);
+
+        // 4. Documents Table
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS documents (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                lawyer_id INT NOT NULL,
+                matter_id INT NOT NULL,
+                file_name VARCHAR(255) NOT NULL,
+                file_type VARCHAR(100) NOT NULL,
+                file_size VARCHAR(50) NOT NULL,
+                content_base64 LONGTEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (lawyer_id) REFERENCES lawyers(id) ON DELETE CASCADE,
+                FOREIGN KEY (matter_id) REFERENCES matters(id) ON DELETE CASCADE
+            );
+        `);
+
+        // 5. Time Entries Table
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS time_entries (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                lawyer_id INT NOT NULL,
+                matter_id INT NOT NULL,
+                billable_hours DECIMAL(10,2) NOT NULL,
+                rate_per_hour DECIMAL(10,2) NOT NULL,
+                description TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (lawyer_id) REFERENCES lawyers(id) ON DELETE CASCADE,
+                FOREIGN KEY (matter_id) REFERENCES matters(id) ON DELETE CASCADE
+            );
+        `);
+
+        // 6. Trust Accounting Table
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS trust_transactions (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                lawyer_id INT NOT NULL,
+                matter_id INT NOT NULL,
+                transaction_type ENUM('deposit', 'withdrawal') NOT NULL,
+                amount DECIMAL(12,2) NOT NULL,
+                description TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (lawyer_id) REFERENCES lawyers(id) ON DELETE CASCADE,
+                FOREIGN KEY (matter_id) REFERENCES matters(id) ON DELETE CASCADE
+            );
+        `);
+
+        // 7. Court Calendar Deadlines Table
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS court_deadlines (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                lawyer_id INT NOT NULL,
+                matter_id INT NOT NULL,
+                title VARCHAR(255) NOT NULL,
+                court_rule VARCHAR(255) NOT NULL,
+                due_date DATE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (lawyer_id) REFERENCES lawyers(id) ON DELETE CASCADE,
+                FOREIGN KEY (matter_id) REFERENCES matters(id) ON DELETE CASCADE
+            );
+        `);
+
+        connection.release();
+        console.log('✅ All database tables verified and operational.');
+    } catch (err) {
+        console.error('❌ Database initialization error:', err.message);
+    }
+}
+
+// --- AUTHENTICATION & ACCESS GUARD MIDDLEWARE ---
 const authenticateToken = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Access denied. Token missing.' });
+
+    if (!token) {
+        return res.status(401).json({ error: 'Access denied. Authentication token missing.' });
+    }
 
     try {
-        const decoded = jwt.decode(token, JWT_SECRET);
+        const decoded = jwt.verify(token, JWT_SECRET);
         
-        // Ensure user account exists and has completed required registration payment
+        // Query user and check payment status
         const [users] = await db.execute('SELECT id, email, is_paid FROM lawyers WHERE id = ?', [decoded.id]);
-        if (!users.length) return res.status(401).json({ error: 'Invalid user session.' });
-        if (!users[0].is_paid) return res.status(403).json({ error: 'Access restricted: Registration payment of R250.00 is pending.' });
+        if (!users.length) {
+            return res.status(401).json({ error: 'User session invalid or account removed.' });
+        }
 
-        req.user = users[0];
+        const user = users[0];
+        if (!user.is_paid) {
+            return res.status(403).json({ 
+                error: 'Access Restricted: Registration payment of R250.00 is required to access the suite.',
+                isPaid: false 
+            });
+        }
+
+        req.user = user;
         next();
     } catch (err) {
-        return res.status(403).json({ error: 'Invalid or expired token.' });
+        return res.status(403).json({ error: 'Invalid or expired session token.' });
     }
 };
 
 // ==========================================
-// 1. PUBLIC AUTHENTICATION & PAYFAST ROUTES
+// 1. PUBLIC AUTHENTICATION & PAYMENT ENDPOINTS
 // ==========================================
 
-// --- LAWYER REGISTRATION (Generates R250 PayFast Payment Payload) ---
+// --- LAWYER REGISTRATION (Generates PayFast R250 Checkout Payload) ---
 app.post('/api/register', async (req, res) => {
     const { firmName, email, password } = req.body;
     if (!firmName || !email || !password) {
@@ -63,11 +197,13 @@ app.post('/api/register', async (req, res) => {
 
     try {
         const [existing] = await db.execute('SELECT id FROM lawyers WHERE email = ?', [email]);
-        if (existing.length) return res.status(400).json({ error: 'Email already registered.' });
+        if (existing.length) {
+            return res.status(400).json({ error: 'Email address is already registered.' });
+        }
 
         const hashedPassword = await bcrypt.hash(password, 10);
         
-        // Insert user as unpaid by default
+        // Insert account as unpaid (is_paid = 0)
         const [result] = await db.execute(
             'INSERT INTO lawyers (firm_name, email, password, is_paid) VALUES (?, ?, ?, 0)',
             [firmName, email, hashedPassword]
@@ -75,13 +211,13 @@ app.post('/api/register', async (req, res) => {
 
         const lawyerId = result.insertId;
 
-        // Construct PayFast R250 Registration Checkout Data
+        // Build PayFast R250 Checkout Data
         const payData = {
             merchant_id: PAYFAST_MERCHANT_ID,
             merchant_key: PAYFAST_MERCHANT_KEY,
-            return_url: `${process.env.APP_FRONTEND_URL || 'http://localhost:3000'}?payment=success`,
-            cancel_url: `${process.env.APP_FRONTEND_URL || 'http://localhost:3000'}?payment=cancelled`,
-            notify_url: `${process.env.APP_BACKEND_URL || 'https://legal-bb34.onrender.com'}/api/payfast/webhook`,
+            return_url: `${APP_FRONTEND_URL}?payment=success`,
+            cancel_url: `${APP_FRONTEND_URL}?payment=cancelled`,
+            notify_url: `${APP_BACKEND_URL}/api/payfast/webhook`,
             m_payment_id: `REG-${lawyerId}-${Date.now()}`,
             amount: '250.00',
             item_name: 'Legal Practice Suite Registration Fee',
@@ -89,7 +225,7 @@ app.post('/api/register', async (req, res) => {
             email_address: email
         };
 
-        // Build MD5 Signature
+        // Generate MD5 PayFast Signature
         let pfParamString = '';
         for (let key in payData) {
             if (payData[key] !== '') {
@@ -103,7 +239,7 @@ app.post('/api/register', async (req, res) => {
         payData.signature = crypto.createHash('md5').update(pfParamString).digest('hex');
 
         res.json({
-            message: 'Account created. Please complete the R250.00 registration payment to activate access.',
+            message: 'Registration initiated. Complete the R250.00 payment to activate your account.',
             payfastUrl: PAYFAST_URL,
             paymentParams: payData
         });
@@ -112,11 +248,11 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-// --- PAYFAST WEBHOOK NOTIFICATION (ITN) ---
+// --- PAYFAST WEBHOOK NOTIFICATION (ITN HANDLER) ---
 app.post('/api/payfast/webhook', async (req, res) => {
     const pfData = req.body;
 
-    // Verify ITN signature
+    // Verify ITN signature integrity
     let pfParamString = '';
     for (let key in pfData) {
         if (key !== 'signature' && pfData[key] !== '') {
@@ -130,16 +266,19 @@ app.post('/api/payfast/webhook', async (req, res) => {
     const calculatedSignature = crypto.createHash('md5').update(pfParamString).digest('hex');
 
     if (calculatedSignature !== pfData.signature) {
-        return res.status(400).send('Invalid signature');
+        console.error('❌ PayFast Webhook error: Signature mismatch');
+        return res.status(400).send('Invalid signature signature');
     }
 
-    // Activate Account if payment is COMPLETE and amount is R250.00
+    // Activate account upon receiving COMPLETE payment for R250.00
     if (pfData.payment_status === 'COMPLETE' && parseFloat(pfData.amount_gross) === 250.00) {
         const lawyerId = pfData.custom_str1;
         try {
             await db.execute('UPDATE lawyers SET is_paid = 1 WHERE id = ?', [lawyerId]);
-            return res.status(200).send('Payment Verified');
+            console.log(`✅ Registration payment of R250.00 verified for Lawyer ID: ${lawyerId}`);
+            return res.status(200).send('Payment Verified and Account Activated');
         } catch (err) {
+            console.error('❌ Webhook DB Update Error:', err.message);
             return res.status(500).send('Database Update Failed');
         }
     }
@@ -153,18 +292,21 @@ app.post('/api/login', async (req, res) => {
 
     try {
         const [users] = await db.execute('SELECT * FROM lawyers WHERE email = ?', [email]);
-        if (!users.length) return res.status(400).json({ error: 'User not found.' });
+        if (!users.length) return res.status(400).json({ error: 'User account not found.' });
 
         const user = users[0];
         const validPassword = await bcrypt.compare(password, user.password);
-        if (!validPassword) return res.status(400).json({ error: 'Invalid credentials.' });
+        if (!validPassword) return res.status(400).json({ error: 'Invalid password.' });
 
         if (!user.is_paid) {
-            return res.status(403).json({ error: 'Account inactive. Please complete the mandatory R250.00 registration fee.' });
+            return res.status(403).json({ 
+                error: 'Account inactive. R250.00 registration payment pending.',
+                isPaid: false 
+            });
         }
 
-        const token = jwt.encode({ id: user.id, email: user.email }, JWT_SECRET);
-        res.json({ token, email: user.email });
+        const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+        res.json({ token, email: user.email, message: 'Authentication successful.' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -174,7 +316,7 @@ app.post('/api/login', async (req, res) => {
 // 2. PROTECTED LEGAL PRACTICE SUITE API
 // ==========================================
 
-// --- STATS OVERVIEW ---
+// --- EXECUTIVE OVERVIEW STATS ---
 app.get('/api/legal/stats', authenticateToken, async (req, res) => {
     try {
         const [[{ activeMatters }]] = await db.execute('SELECT COUNT(*) as activeMatters FROM matters WHERE lawyer_id = ?', [req.user.id]);
@@ -186,8 +328,8 @@ app.get('/api/legal/stats', authenticateToken, async (req, res) => {
         );
 
         res.json({
-            activeMatters,
-            totalClients,
+            activeMatters: activeMatters || 0,
+            totalClients: totalClients || 0,
             unbilledWip: unbilledWip || 0,
             trustBalance: trustBalance || 0
         });
@@ -196,7 +338,7 @@ app.get('/api/legal/stats', authenticateToken, async (req, res) => {
     }
 });
 
-// --- CLIENT INTAKE & CONFLICT CHECK ---
+// --- CLIENT INTAKE & CONFLICT SEARCH ---
 app.get('/api/legal/clients', authenticateToken, async (req, res) => {
     try {
         const [clients] = await db.execute('SELECT * FROM clients WHERE lawyer_id = ? ORDER BY id DESC', [req.user.id]);
@@ -207,7 +349,7 @@ app.get('/api/legal/clients', authenticateToken, async (req, res) => {
 app.post('/api/legal/clients', authenticateToken, async (req, res) => {
     const { fullName, email, phone, idNumber } = req.body;
     try {
-        // Run Conflict Check
+        // Perform Automated Conflict Search across prior records
         const [matches] = await db.execute(
             'SELECT * FROM clients WHERE lawyer_id = ? AND (full_name LIKE ? OR id_number = ?)',
             [req.user.id, `%${fullName}%`, idNumber]
@@ -219,14 +361,14 @@ app.post('/api/legal/clients', authenticateToken, async (req, res) => {
         );
 
         const msg = matches.length > 0 
-            ? `Client registered. WARNING: Potential conflict match found (${matches.length} prior entries).` 
-            : 'Client registered successfully with zero conflicts detected.';
+            ? `Client intake saved. WARNING: ${matches.length} conflict match(es) detected.` 
+            : 'Client registered successfully with zero conflict matches detected.';
 
         res.json({ message: msg });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- MATTERS & CASES ---
+// --- CASE & MATTER MANAGEMENT ---
 app.get('/api/legal/matters', authenticateToken, async (req, res) => {
     try {
         const [matters] = await db.execute(
@@ -244,7 +386,7 @@ app.post('/api/legal/matters', authenticateToken, async (req, res) => {
             'INSERT INTO matters (lawyer_id, client_id, case_number, title, court) VALUES (?, ?, ?, ?, ?)',
             [req.user.id, clientId, caseNumber, title, court]
         );
-        res.json({ message: 'Matter record opened successfully.' });
+        res.json({ message: 'Matter record created successfully.' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -266,19 +408,19 @@ app.post('/api/legal/documents', authenticateToken, async (req, res) => {
             'INSERT INTO documents (lawyer_id, matter_id, file_name, file_type, file_size, content_base64) VALUES (?, ?, ?, ?, ?, ?)',
             [req.user.id, matterId, fileName, fileType, fileSize, contentBase64]
         );
-        res.json({ message: 'Document persisted to TiDB Vault.' });
+        res.json({ message: 'Document uploaded and stored in TiDB Vault.' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/legal/documents/:id/download', authenticateToken, async (req, res) => {
     try {
         const [docs] = await db.execute('SELECT file_name, file_type, content_base64 FROM documents WHERE id = ? AND lawyer_id = ?', [req.params.id, req.user.id]);
-        if (!docs.length) return res.status(404).json({ error: 'Document not found.' });
+        if (!docs.length) return res.status(404).json({ error: 'Document record not found.' });
         res.json(docs[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- TIME & EXPENSES ---
+// --- TIME & EXPENSE ENTRIES ---
 app.get('/api/legal/time', authenticateToken, async (req, res) => {
     try {
         const [entries] = await db.execute(
@@ -296,11 +438,11 @@ app.post('/api/legal/time', authenticateToken, async (req, res) => {
             'INSERT INTO time_entries (lawyer_id, matter_id, billable_hours, rate_per_hour, description) VALUES (?, ?, ?, ?, ?)',
             [req.user.id, matterId, hours, rate, description]
         );
-        res.json({ message: 'Fee entry recorded.' });
+        res.json({ message: 'Fee entry logged.' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- TRUST ACCOUNTING ---
+// --- TRUST ACCOUNTING LEDGERS ---
 app.get('/api/legal/trust', authenticateToken, async (req, res) => {
     try {
         const [trust] = await db.execute(
@@ -318,11 +460,11 @@ app.post('/api/legal/trust/deposit', authenticateToken, async (req, res) => {
             'INSERT INTO trust_transactions (lawyer_id, matter_id, transaction_type, amount, description) VALUES (?, ?, ?, ?, ?)',
             [req.user.id, matterId, transactionType, amount, description]
         );
-        res.json({ message: 'Trust accounting ledger updated.' });
+        res.json({ message: 'Trust transaction posted to ledger.' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- COURT CALENDAR ---
+// --- COURT CALENDAR & DEADLINE RULES ---
 app.get('/api/legal/calendar', authenticateToken, async (req, res) => {
     try {
         const [cal] = await db.execute(
@@ -343,7 +485,7 @@ app.post('/api/legal/calendar', authenticateToken, async (req, res) => {
             'INSERT INTO court_deadlines (lawyer_id, matter_id, title, court_rule, due_date) VALUES (?, ?, ?, ?, ?)',
             [req.user.id, matterId, title, courtRule, due.toISOString().split('T')[0]]
         );
-        res.json({ message: 'Court deadline computed and scheduled.' });
+        res.json({ message: 'Court deadline rule calculated and saved.' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -353,18 +495,18 @@ app.post('/api/legal/ai/analyze', authenticateToken, async (req, res) => {
     try {
         let output = '';
         if (actionType === 'summarize') {
-            output = `[EXECUTIVE SUMMARY]\n- Key Fact: ${inputText.substring(0, 150)}...\n- Legal Issue: Administrative compliance and procedural fairness.\n- Recommendation: Proceed with urgent interdict under PAJA Section 6.`;
+            output = `[EXECUTIVE LEGAL SUMMARY]\n- Core Fact: ${inputText.substring(0, 150)}...\n- Ground: PAJA Judicial Review / Rule 53 Compliance.\n- Next Step: Deliver Rule 53 record request within 15 court days.`;
         } else if (actionType === 'affidavit') {
-            output = `IN THE HIGH COURT OF SOUTH AFRICA\nCASE NO: HC-2026-REF\n\nIn the matter between:\nAPPLICANT: Practice Client\nRESPONDENT: State / Opposing Party\n\nFOUNDING AFFIDAVIT\nI, the undersigned, do hereby make oath and state:\n1. Facts: ${inputText}`;
+            output = `IN THE HIGH COURT OF SOUTH AFRICA\nCASE NO: HC-2026-REF\n\nIn the matter between:\nAPPLICANT: Registered Client\nRESPONDENT: Municipal Council / Board\n\nFOUNDING AFFIDAVIT\nI, the undersigned, declare under oath:\n1. Statements: ${inputText}`;
         } else {
-            output = `[CLAUSE RISK ANALYSIS]\n- Identified Risk: Unilateral tariff increases and strict liability.\n- Mitigation Clause: Insert 30-day notice and mandatory arbitration prior to enforcement.`;
+            output = `[CLAUSE RISK ANALYSIS]\n- Identified Clause Risk: Unilateral tariff revision.\n- Remedy: Insert compulsory 30-day notice and PAJA review clause prior to implementation.`;
         }
 
-        res.json({ message: 'AI processing complete.', output });
+        res.json({ message: 'AI task complete.', output });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- GLOBAL MULTI-TABLE SEARCH ---
+// --- GLOBAL MULTI-TABLE DATABASE SEARCH ---
 app.get('/api/legal/search', authenticateToken, async (req, res) => {
     const q = req.query.q ? `%${req.query.q.trim()}%` : null;
     if (!q) return res.json({ clients: [], matters: [], documents: [], timeEntries: [] });
@@ -393,5 +535,8 @@ app.get('/api/legal/search', authenticateToken, async (req, res) => {
     }
 });
 
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// Start Server and Initialize TiDB Tables
+app.listen(PORT, async () => {
+    console.log(`🚀 Server active on port ${PORT}`);
+    await initializeDatabase();
+});
