@@ -22,8 +22,6 @@ const JWT_SECRET = process.env.JWT_SECRET || 'legal_secret_key_rsa_2026_secure_h
 
 /**
  * Robust Database Connection Pool configured specifically for TiDB Cloud Serverless & Render.
- * Using `ssl: 'Amazon RDS'` or a custom configuration object eliminates the "illegal argument" 
- * or certificate parsing exceptions thrown by strict Node.js TLS verifications when connecting to remote SQL endpoints.
  */
 const pool = mysql.createPool({
     host: process.env.DB_HOST || 'localhost',
@@ -74,7 +72,7 @@ app.get('/', (req, res) => {
     res.status(200).json({
         status: 'online',
         system: 'RSA Legal Practice Suite Enterprise Backend',
-        version: '4.2.0-production',
+        version: '4.2.1-production',
         environment: process.env.NODE_ENV || 'development',
         timestamp: new Date().toISOString()
     });
@@ -141,6 +139,12 @@ app.post('/api/login', async (req, res) => {
         }
 
         const lawyer = rows[0];
+        
+        // Safety check if password field exists on record
+        if (!lawyer.password) {
+            return res.status(500).json({ error: 'Database record error: Password hash missing for user account.' });
+        }
+
         const validPassword = await bcrypt.compare(password, lawyer.password);
         
         if (!validPassword) {
@@ -232,7 +236,6 @@ app.post('/api/legal/clients', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'Client full name and email are mandatory parameters.' });
         }
 
-        // Perform automated conflict check simulation
         const [conflictCheck] = await pool.query(
             'SELECT id, full_name FROM clients WHERE lawyer_id = ? AND (email = ? OR id_number = ?)',
             [req.user.id, email, idNumber || '']
