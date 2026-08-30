@@ -8,7 +8,6 @@ const crypto = require('crypto');
 
 const app = express();
 
-// Enable CORS and Express body parsing
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
@@ -16,14 +15,15 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // --- DATABASE CONNECTION (TiDB Cloud / MySQL) ---
 const db = mysql.createPool({
     host: process.env.TIDB_HOST,
-    port: process.env.TIDB_PORT || 4000,
+    port: parseInt(process.env.TIDB_PORT || '4000', 10),
     user: process.env.TIDB_USER,
     password: process.env.TIDB_PASSWORD,
     database: process.env.TIDB_DATABASE,
     ssl: { rejectUnauthorized: true },
     waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
+    connectionLimit: 5,
+    queueLimit: 0,
+    connectTimeout: 30000 // 30 seconds timeout to prevent immediate ETIMEDOUT on cold starts
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_legal_suite_key_2026';
@@ -32,96 +32,107 @@ const PAYFAST_MERCHANT_ID = process.env.PAYFAST_MERCHANT_ID || '10000100';
 const PAYFAST_MERCHANT_KEY = process.env.PAYFAST_MERCHANT_KEY || '46f0cd435f439';
 const PAYFAST_URL = process.env.PAYFAST_URL || 'https://sandbox.payfast.co.za/eng/process';
 
-// --- TABLE INITIALIZATION SETUP ---
-async function initDatabaseTables() {
-    try {
-        await db.query(`
-            CREATE TABLE IF NOT EXISTS lawyers (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                firm_name VARCHAR(255) NOT NULL,
-                email VARCHAR(255) NOT NULL UNIQUE,
-                password VARCHAR(255) NOT NULL,
-                is_paid TINYINT(1) DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
+// --- TABLE INITIALIZATION SETUP WITH RETRY LOGIC ---
+async function initDatabaseTables(retries = 5, delay = 5000) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            console.log(`Attempting database connection to TiDB (Attempt ${i + 1}/${retries})...`);
+            
+            await db.query(`
+                CREATE TABLE IF NOT EXISTS lawyers (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    firm_name VARCHAR(255) NOT NULL,
+                    email VARCHAR(255) NOT NULL UNIQUE,
+                    password VARCHAR(255) NOT NULL,
+                    is_paid TINYINT(1) DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            `);
 
-        await db.query(`
-            CREATE TABLE IF NOT EXISTS clients (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                lawyer_id INT NOT NULL,
-                full_name VARCHAR(255) NOT NULL,
-                email VARCHAR(255) NOT NULL,
-                phone VARCHAR(50) NOT NULL,
-                id_number VARCHAR(100) NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
+            await db.query(`
+                CREATE TABLE IF NOT EXISTS clients (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    lawyer_id INT NOT NULL,
+                    full_name VARCHAR(255) NOT NULL,
+                    email VARCHAR(255) NOT NULL,
+                    phone VARCHAR(50) NOT NULL,
+                    id_number VARCHAR(100) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            `);
 
-        await db.query(`
-            CREATE TABLE IF NOT EXISTS matters (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                lawyer_id INT NOT NULL,
-                client_id INT NOT NULL,
-                case_number VARCHAR(100) NOT NULL,
-                title VARCHAR(255) NOT NULL,
-                court VARCHAR(255) NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
+            await db.query(`
+                CREATE TABLE IF NOT EXISTS matters (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    lawyer_id INT NOT NULL,
+                    client_id INT NOT NULL,
+                    case_number VARCHAR(100) NOT NULL,
+                    title VARCHAR(255) NOT NULL,
+                    court VARCHAR(255) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            `);
 
-        await db.query(`
-            CREATE TABLE IF NOT EXISTS documents (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                lawyer_id INT NOT NULL,
-                matter_id INT NOT NULL,
-                file_name VARCHAR(255) NOT NULL,
-                file_type VARCHAR(100) NOT NULL,
-                file_size VARCHAR(50) NOT NULL,
-                content_base64 LONGTEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
+            await db.query(`
+                CREATE TABLE IF NOT EXISTS documents (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    lawyer_id INT NOT NULL,
+                    matter_id INT NOT NULL,
+                    file_name VARCHAR(255) NOT NULL,
+                    file_type VARCHAR(100) NOT NULL,
+                    file_size VARCHAR(50) NOT NULL,
+                    content_base64 LONGTEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            `);
 
-        await db.query(`
-            CREATE TABLE IF NOT EXISTS time_entries (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                lawyer_id INT NOT NULL,
-                matter_id INT NOT NULL,
-                billable_hours DECIMAL(10,2) NOT NULL,
-                rate_per_hour DECIMAL(10,2) NOT NULL,
-                description TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
+            await db.query(`
+                CREATE TABLE IF NOT EXISTS time_entries (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    lawyer_id INT NOT NULL,
+                    matter_id INT NOT NULL,
+                    billable_hours DECIMAL(10,2) NOT NULL,
+                    rate_per_hour DECIMAL(10,2) NOT NULL,
+                    description TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            `);
 
-        await db.query(`
-            CREATE TABLE IF NOT EXISTS trust_transactions (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                lawyer_id INT NOT NULL,
-                matter_id INT NOT NULL,
-                transaction_type ENUM('deposit', 'withdrawal') NOT NULL,
-                amount DECIMAL(12,2) NOT NULL,
-                description TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
+            await db.query(`
+                CREATE TABLE IF NOT EXISTS trust_transactions (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    lawyer_id INT NOT NULL,
+                    matter_id INT NOT NULL,
+                    transaction_type ENUM('deposit', 'withdrawal') NOT NULL,
+                    amount DECIMAL(12,2) NOT NULL,
+                    description TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            `);
 
-        await db.query(`
-            CREATE TABLE IF NOT EXISTS court_deadlines (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                lawyer_id INT NOT NULL,
-                matter_id INT NOT NULL,
-                title VARCHAR(255) NOT NULL,
-                court_rule VARCHAR(255) NOT NULL,
-                due_date DATE NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
+            await db.query(`
+                CREATE TABLE IF NOT EXISTS court_deadlines (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    lawyer_id INT NOT NULL,
+                    matter_id INT NOT NULL,
+                    title VARCHAR(255) NOT NULL,
+                    court_rule VARCHAR(255) NOT NULL,
+                    due_date DATE NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            `);
 
-        console.log('TiDB Cloud database schema successfully verified/initialized.');
-    } catch (err) {
-        console.error('Database Initialization Error:', err.message);
+            console.log('TiDB Cloud database schema successfully verified/initialized.');
+            return;
+        } catch (err) {
+            console.error(`Database connection attempt ${i + 1} failed: ${err.message}`);
+            if (i < retries - 1) {
+                console.log(`Retrying in ${delay / 1000} seconds... (Check if TiDB IP Allowlist includes 0.0.0.0/0)`);
+                await new Promise(res => setTimeout(res, delay));
+            } else {
+                console.error('All database connection retries exhausted. Please verify your TIDB environment variables and network firewalls.');
+            }
+        }
     }
 }
 initDatabaseTables();
@@ -150,7 +161,6 @@ const authenticateToken = async (req, res, next) => {
 // 1. PUBLIC AUTHENTICATION & PAYFAST ROUTES
 // ==========================================
 
-// --- LAWYER REGISTRATION ---
 app.post('/api/register', async (req, res) => {
     const { firmName, email, password } = req.body;
     if (!firmName || !email || !password) {
@@ -170,7 +180,6 @@ app.post('/api/register', async (req, res) => {
 
         const lawyerId = result.insertId;
 
-        // Construct PayFast R250 Registration Checkout Data
         const payData = {
             merchant_id: PAYFAST_MERCHANT_ID,
             merchant_key: PAYFAST_MERCHANT_KEY,
@@ -184,7 +193,6 @@ app.post('/api/register', async (req, res) => {
             email_address: email
         };
 
-        // Build MD5 Signature
         let pfParamString = '';
         for (let key in payData) {
             if (payData[key] !== '') {
@@ -207,7 +215,6 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-// --- PAYFAST WEBHOOK NOTIFICATION (ITN) ---
 app.post('/api/payfast/webhook', async (req, res) => {
     const pfData = req.body;
 
@@ -240,7 +247,6 @@ app.post('/api/payfast/webhook', async (req, res) => {
     res.status(200).send('Notification Received');
 });
 
-// --- LOGIN ROUTE ---
 app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
 
@@ -267,7 +273,6 @@ app.post('/api/login', async (req, res) => {
 // 2. PROTECTED LEGAL PRACTICE SUITE API
 // ==========================================
 
-// --- STATS OVERVIEW ---
 app.get('/api/legal/stats', authenticateToken, async (req, res) => {
     try {
         const [[{ activeMatters }]] = await db.execute('SELECT COUNT(*) as activeMatters FROM matters WHERE lawyer_id = ?', [req.user.id]);
@@ -289,7 +294,6 @@ app.get('/api/legal/stats', authenticateToken, async (req, res) => {
     }
 });
 
-// --- CLIENT INTAKE & CONFLICT CHECK ---
 app.get('/api/legal/clients', authenticateToken, async (req, res) => {
     try {
         const [clients] = await db.execute('SELECT * FROM clients WHERE lawyer_id = ? ORDER BY id DESC', [req.user.id]);
@@ -318,7 +322,6 @@ app.post('/api/legal/clients', authenticateToken, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- MATTERS & CASES ---
 app.get('/api/legal/matters', authenticateToken, async (req, res) => {
     try {
         const [matters] = await db.execute(
@@ -340,7 +343,6 @@ app.post('/api/legal/matters', authenticateToken, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- DOCUMENT VAULT (TiDB STORAGE) ---
 app.get('/api/legal/documents', authenticateToken, async (req, res) => {
     try {
         const [docs] = await db.execute(
@@ -370,7 +372,6 @@ app.get('/api/legal/documents/:id/download', authenticateToken, async (req, res)
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- TIME & EXPENSES ---
 app.get('/api/legal/time', authenticateToken, async (req, res) => {
     try {
         const [entries] = await db.execute(
@@ -392,7 +393,6 @@ app.post('/api/legal/time', authenticateToken, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- TRUST ACCOUNTING ---
 app.get('/api/legal/trust', authenticateToken, async (req, res) => {
     try {
         const [trust] = await db.execute(
@@ -414,7 +414,6 @@ app.post('/api/legal/trust/deposit', authenticateToken, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- COURT CALENDAR ---
 app.get('/api/legal/calendar', authenticateToken, async (req, res) => {
     try {
         const [cal] = await db.execute(
@@ -439,7 +438,6 @@ app.post('/api/legal/calendar', authenticateToken, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- AI LEGAL ENGINE ---
 app.post('/api/legal/ai/analyze', authenticateToken, async (req, res) => {
     const { matterId, actionType, inputText } = req.body;
     try {
@@ -456,7 +454,6 @@ app.post('/api/legal/ai/analyze', authenticateToken, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- GLOBAL MULTI-TABLE SEARCH ---
 app.get('/api/legal/search', authenticateToken, async (req, res) => {
     const q = req.query.q ? `%${req.query.q.trim()}%` : null;
     if (!q) return res.json({ clients: [], matters: [], documents: [], timeEntries: [] });
