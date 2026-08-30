@@ -10,7 +10,7 @@ app.use(cors());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'legal_secret_key_2026';
 
-// Database connection pool configuration with clean SSL support for Render & TiDB
+// Database connection pool configuration with bulletproof SSL setup for TiDB Serverless & Render
 const pool = mysql.createPool({
     host: process.env.DB_HOST || 'localhost',
     user: process.env.DB_USER || 'root',
