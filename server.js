@@ -110,7 +110,7 @@ app.post('/api/register', async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, saltRounds);
 
         const [result] = await pool.query(
-            'INSERT INTO lawyers (firm_name, email, password) VALUES (?, ?, ?)',
+            'INSERT INTO lawyers (firm_name, email, password_hash) VALUES (?, ?, ?)',
             [firmName, email, hashedPassword]
         );
 
@@ -139,13 +139,13 @@ app.post('/api/login', async (req, res) => {
         }
 
         const lawyer = rows[0];
+        const storedHash = lawyer.password_hash || lawyer.password;
         
-        // Safety check if password field exists on record
-        if (!lawyer.password) {
+        if (!storedHash) {
             return res.status(500).json({ error: 'Database record error: Password hash missing for user account.' });
         }
 
-        const validPassword = await bcrypt.compare(password, lawyer.password);
+        const validPassword = await bcrypt.compare(password, storedHash);
         
         if (!validPassword) {
             return res.status(400).json({ error: 'Invalid email address or password combination.' });
