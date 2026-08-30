@@ -10,13 +10,13 @@ app.use(cors());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'legal_secret_key_2026';
 
-// Database connection pool configuration
+// Database connection pool configuration with clean SSL support for Render & TiDB
 const pool = mysql.createPool({
     host: process.env.DB_HOST || 'localhost',
     user: process.env.DB_USER || 'root',
     password: process.env.DB_PASSWORD || '',
     database: process.env.DB_NAME || 'legal_db',
-    port: process.env.DB_PORT ? parseInt(process.env.DB_PORT) : 4000,
+    port: process.env.DB_PORT || 4000,
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0,
