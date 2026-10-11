@@ -73,7 +73,7 @@ app.get('/', (req, res) => {
     res.status(200).json({
         status: 'online',
         system: 'RSA Legal Practice Management Suite Enterprise Engine',
-        version: '4.2.5-production',
+        version: '4.3.0-production',
         environment: process.env.NODE_ENV || 'development',
         timestamp: new Date().toISOString()
     });
@@ -91,7 +91,7 @@ app.get('/api/health', async (req, res) => {
 });
 
 // ============================================================================
-// 1. LAWYER AUTHENTICATION & PRACTICE REGISTRATION SUBSYSTEM
+// 1. LAWYER AUTHENTICATION & PAYFAST R300 LICENSE SUBSYSTEM
 // ============================================================================
 
 app.post('/api/register', async (req, res) => {
@@ -102,27 +102,81 @@ app.post('/api/register', async (req, res) => {
             return res.status(400).json({ error: 'All fields (firmName, email, password) are strictly required.' });
         }
 
-        const [existingLawyers] = await pool.query('SELECT id FROM lawyers WHERE email = ?', [email]);
+        const [existingLawyers] = await pool.query('SELECT id, payment_status FROM lawyers WHERE email = ?', [email]);
         if (existingLawyers.length > 0) {
-            return res.status(400).json({ error: 'An account with this email address already exists.' });
+            if (existingLawyers[0].payment_status === 'paid') {
+                return res.status(400).json({ error: 'An account with this email address already exists and is active.' });
+            } else {
+                // Allow proceeding to payment if previously registered but unpaid
+                return res.status(200).json({
+                    success: true,
+                    requiresPayment: true,
+                    amount: '300.00',
+                    merchantId: '32880521',
+                    merchantKey: 'wfx9nr9j9cvlm',
+                    returnUrl: 'https://small-king-6969.tebogoanthony455.workers.dev/?payment=success',
+                    cancelUrl: 'https://small-king-6969.tebogoanthony455.workers.dev/?payment=cancel',
+                    notifyUrl: 'https://legal-bb34.onrender.com/api/payfast/notify',
+                    email,
+                    firmName,
+                    message: 'Pending account located. Proceeding to PayFast R300 secure checkout.'
+                });
+            }
         }
 
         const saltRounds = 12;
         const hashedPassword = await bcrypt.hash(password, saltRounds);
 
+        // Register user with pending payment status until R300 PayFast payment completes
         const [result] = await pool.query(
-            'INSERT INTO lawyers (firm_name, email, password_hash) VALUES (?, ?, ?)',
-            [firmName, email, hashedPassword]
+            'INSERT INTO lawyers (firm_name, email, password_hash, payment_status) VALUES (?, ?, ?, ?)',
+            [firmName, email, hashedPassword, 'pending']
         );
+
+        // PayFast Configuration details
+        const merchantId = '32880521';
+        const merchantKey = 'wfx9nr9j9cvlm';
+        const returnUrl = 'https://small-king-6969.tebogoanthony455.workers.dev/?payment=success';
+        const cancelUrl = 'https://small-king-6969.tebogoanthony455.workers.dev/?payment=cancel';
+        const notifyUrl = 'https://legal-bb34.onrender.com/api/payfast/notify';
 
         res.status(201).json({ 
             success: true,
-            message: 'Lawyer practice account registered successfully. You may now log in.',
-            lawyerId: result.insertId 
+            requiresPayment: true,
+            amount: '300.00',
+            merchantId,
+            merchantKey,
+            returnUrl,
+            cancelUrl,
+            notifyUrl,
+            email,
+            firmName,
+            lawyerId: result.insertId,
+            message: 'Account registered. Proceeding to PayFast R300 secure checkout.' 
         });
     } catch (err) {
         console.error('Registration Error:', err);
         res.status(500).json({ error: 'Internal database error during user registration: ' + err.message });
+    }
+});
+
+// PayFast ITN (Instant Transaction Notification) webhook receiver
+app.post('/api/payfast/notify', async (req, res) => {
+    try {
+        const paymentData = req.body;
+        console.log('[PAYFAST NOTIFICATION RECEIVED]:', paymentData);
+        
+        if (paymentData && (paymentData.payment_status === 'COMPLETE' || paymentData.status === 'COMPLETE')) {
+            const payerEmail = paymentData.email_address || paymentData.m_payment_id;
+            await pool.query(
+                "UPDATE lawyers SET payment_status = 'paid' WHERE email = ? OR id = ?",
+                [payerEmail, paymentData.custom_str1 || 0]
+            );
+        }
+        res.status(200).send('OK');
+    } catch (err) {
+        console.error('PayFast Notify Error:', err);
+        res.status(500).send(err.message);
     }
 });
 
@@ -140,6 +194,14 @@ app.post('/api/login', async (req, res) => {
         }
 
         const lawyer = rows[0];
+
+        // Ensure R300 once-off payment has been settled
+        if (lawyer.payment_status !== 'paid') {
+            return res.status(403).json({ 
+                error: 'Account license fee unpaid. Please complete the once-off R300 PayFast payment to activate your account.' 
+            });
+        }
+
         const storedHash = lawyer.password_hash || lawyer.password;
         
         if (!storedHash) {
