@@ -3,7 +3,7 @@
  * L3 LEGAL PRACTICE MANAGEMENT & ENTERPRISE POS SUITE
  * Enterprise Full-Stack Backend Server (Node.js & Express)
  * Target Deployment: Render Cloud Hosting & TiDB Cloud Serverless (MySQL)
- * Complete with Encrypted Session Socket & MTN SMS v3 Gateway Integration
+ * Complete with Encrypted Session Socket, MTN SMS v3 Gateway, HR, & Job Board
  * ============================================================================
  */
 
@@ -78,6 +78,71 @@ async function initializeDatabaseTables() {
             )
         `);
 
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS job_postings (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                lawyer_id INT NOT NULL,
+                job_title VARCHAR(255) NOT NULL,
+                company_intro TEXT NOT NULL,
+                department VARCHAR(150) NOT NULL,
+                reference_number VARCHAR(100) NOT NULL,
+                key_responsibilities TEXT NOT NULL,
+                requirements TEXT NOT NULL,
+                employment_type VARCHAR(100) NOT NULL,
+                geographic_location VARCHAR(150) NOT NULL,
+                work_arrangement VARCHAR(100) NOT NULL,
+                perks TEXT NULL,
+                salary_range VARCHAR(150) NOT NULL,
+                benefits TEXT NULL,
+                how_to_apply TEXT NOT NULL,
+                required_documentation TEXT NOT NULL,
+                closing_date DATE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS hr_employees (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                lawyer_id INT NOT NULL,
+                full_name VARCHAR(255) NOT NULL,
+                id_number VARCHAR(50) NOT NULL,
+                email VARCHAR(255) NOT NULL,
+                phone VARCHAR(50) NOT NULL,
+                position VARCHAR(150) NOT NULL,
+                department VARCHAR(150) NOT NULL,
+                employment_type VARCHAR(50) DEFAULT 'Permanent',
+                monthly_salary DECIMAL(10,2) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS hr_leave (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                lawyer_id INT NOT NULL,
+                employee_id INT NOT NULL,
+                leave_type VARCHAR(100) NOT NULL,
+                start_date DATE NOT NULL,
+                end_date DATE NOT NULL,
+                status VARCHAR(50) DEFAULT 'Approved',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS hr_ir_logs (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                lawyer_id INT NOT NULL,
+                employee_id INT NOT NULL,
+                incident_type VARCHAR(100) NOT NULL,
+                description TEXT NOT NULL,
+                action_taken TEXT NOT NULL,
+                status VARCHAR(50) DEFAULT 'Open',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
         try {
             await pool.query(`ALTER TABLE court_deadlines ADD COLUMN reminder_sent TINYINT(1) DEFAULT 0`);
         } catch (e) {
@@ -132,9 +197,6 @@ connectMessagingSocket();
 
 // --- SEPARATED ROUTING DISPATCH ENGINES ---
 
-/**
- * Dispatch WhatsApp message only (used for automated system events: client registration, appointments, trust updates).
- */
 async function sendWhatsAppMessage(phone, message) {
     let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
     if (formattedPhone.startsWith('0')) {
@@ -155,9 +217,6 @@ async function sendWhatsAppMessage(phone, message) {
     return false;
 }
 
-/**
- * Dispatch SMS only via MTN SMS v3 API (used strictly for manual user-initiated SMS sending).
- */
 async function sendSmsApi(phone, message) {
     let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
     if (formattedPhone.startsWith('0')) {
@@ -615,6 +674,201 @@ app.get('/api/legal/documents/:id/download', authenticateToken, async (req, res)
     }
 });
 
+// Endpoint to send/share documents with clients/users via SMS/WhatsApp
+app.post('/api/legal/documents/send', authenticateToken, async (req, res) => {
+    try {
+        const { documentId, recipientPhone, recipientEmail, channel } = req.body;
+        if (!documentId || !recipientPhone) {
+            return res.status(400).json({ error: 'Document reference and recipient phone are required.' });
+        }
+
+        const [docRows] = await pool.query('SELECT * FROM documents WHERE id = ? AND lawyer_id = ?', [documentId, req.user.id]);
+        if (docRows.length === 0) {
+            return res.status(404).json({ error: 'Document not found in vault.' });
+        }
+
+        const doc = docRows[0];
+        const msg = `Notice from ${req.user.firmName}: Document "${doc.file_name}" has been shared with you.`;
+
+        if (channel === 'sms') {
+            await sendSmsApi(recipientPhone, msg);
+        } else {
+            await sendWhatsAppMessage(recipientPhone, msg);
+        }
+
+        res.status(200).json({ success: true, message: `Document "${doc.file_name}" successfully dispatched to ${recipientPhone}.` });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to send document: ' + err.message });
+    }
+});
+
+// ============================================================================
+// 5.1. LAW FIRM JOB BOARD & RECRUITMENT SUBSYSTEM
+// ============================================================================
+
+app.get('/api/jobs', async (req, res) => {
+    try {
+        const [rows] = await pool.query(`
+            SELECT job_postings.*, lawyers.firm_name 
+            FROM job_postings 
+            JOIN lawyers ON job_postings.lawyer_id = lawyers.id 
+            ORDER BY job_postings.id DESC
+        `);
+        res.status(200).json(rows);
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to retrieve job board listings: ' + err.message });
+    }
+});
+
+app.get('/api/legal/jobs', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await pool.query('SELECT * FROM job_postings WHERE lawyer_id = ? ORDER BY id DESC', [req.user.id]);
+        res.status(200).json(rows);
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch law firm job postings: ' + err.message });
+    }
+});
+
+app.post('/api/legal/jobs', authenticateToken, async (req, res) => {
+    try {
+        const { 
+            jobTitle, companyIntro, department, referenceNumber, 
+            keyResponsibilities, requirements, employmentType, 
+            geographicLocation, workArrangement, perks, salaryRange, 
+            benefits, howToApply, requiredDocumentation, closingDate 
+        } = req.body;
+
+        if (!jobTitle || !referenceNumber || !closingDate) {
+            return res.status(400).json({ error: 'Job title, reference number, and closing date are mandatory.' });
+        }
+
+        const [result] = await pool.query(`
+            INSERT INTO job_postings (
+                lawyer_id, job_title, company_intro, department, reference_number,
+                key_responsibilities, requirements, employment_type, geographic_location,
+                work_arrangement, perks, salary_range, benefits, how_to_apply,
+                required_documentation, closing_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+            req.user.id, jobTitle, companyIntro, department, referenceNumber,
+            keyResponsibilities, requirements, employmentType, geographicLocation,
+            workArrangement, perks, salaryRange, benefits, howToApply,
+            requiredDocumentation, closingDate
+        ]);
+
+        res.status(201).json({ success: true, message: 'Job posting published successfully.', jobId: result.insertId });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to create job posting: ' + err.message });
+    }
+});
+
+// ============================================================================
+// 5.2. SOUTH AFRICAN HUMAN RESOURCES (HR) & PAYROLL SUBSYSTEM
+// ============================================================================
+
+app.get('/api/legal/hr/employees', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await pool.query('SELECT * FROM hr_employees WHERE lawyer_id = ? ORDER BY id DESC', [req.user.id]);
+        res.status(200).json(rows);
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch employees: ' + err.message });
+    }
+});
+
+app.post('/api/legal/hr/employees', authenticateToken, async (req, res) => {
+    try {
+        const { fullName, idNumber, email, phone, position, department, employmentType, monthlySalary } = req.body;
+        if (!fullName || !monthlySalary) {
+            return res.status(400).json({ error: 'Full name and monthly salary are required.' });
+        }
+
+        const [result] = await pool.query(`
+            INSERT INTO hr_employees (lawyer_id, full_name, id_number, email, phone, position, department, employment_type, monthly_salary)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [req.user.id, fullName, idNumber, email, phone, position, department, employmentType || 'Permanent', monthlySalary]);
+
+        res.status(201).json({ success: true, message: 'Employee added successfully.', employeeId: result.insertId });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to add employee: ' + err.message });
+    }
+});
+
+// South African Statutory Payroll Calculation (SARS PAYE, UIF, SDL)
+app.get('/api/legal/hr/payroll', authenticateToken, async (req, res) => {
+    try {
+        const [employees] = await pool.query('SELECT * FROM hr_employees WHERE lawyer_id = ?', [req.user.id]);
+        
+        const payrollSummary = employees.map(emp => {
+            const gross = parseFloat(emp.monthly_salary);
+            // UIF: 1% capped at R17,712 remuneration per month (max R177.12 each side)
+            const uifBase = Math.min(gross, 17712.00);
+            const employeeUif = uifBase * 0.01;
+            const employerUif = uifBase * 0.01;
+            
+            // SDL: 1% employer levy
+            const employerSdl = gross * 0.01;
+
+            // Simplified SARS 2026/2027 annualised tax estimation
+            const annualGross = gross * 12;
+            let annualTax = 0;
+            if (annualGross > 99000) {
+                if (annualGross <= 245100) annualTax = annualGross * 0.18;
+                else if (annualGross <= 383100) annualTax = 44118 + (annualGross - 245100) * 0.26;
+                else if (annualGross <= 530200) annualTax = 79998 + (annualGross - 383100) * 0.31;
+                else annualTax = 125599 + (annualGross - 530200) * 0.36;
+                annualTax = Math.max(0, annualTax - 17820); // Primary Rebate
+            }
+            const monthlyPaye = annualTax / 12;
+            const netPay = gross - monthlyPaye - employeeUif;
+
+            return {
+                id: emp.id,
+                fullName: emp.full_name,
+                position: emp.position,
+                grossSalary: gross,
+                employeeUif: parseFloat(employeeUif.toFixed(2)),
+                employerUif: parseFloat(employerUif.toFixed(2)),
+                employerSdl: parseFloat(employerSdl.toFixed(2)),
+                monthlyPaye: parseFloat(monthlyPaye.toFixed(2)),
+                netPay: parseFloat(netPay.toFixed(2))
+            };
+        });
+
+        res.status(200).json(payrollSummary);
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to calculate payroll: ' + err.message });
+    }
+});
+
+app.get('/api/legal/hr/ir', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await pool.query(`
+            SELECT hr_ir_logs.*, hr_employees.full_name as employee_name 
+            FROM hr_ir_logs 
+            JOIN hr_employees ON hr_ir_logs.employee_id = hr_employees.id 
+            WHERE hr_ir_logs.lawyer_id = ? 
+            ORDER BY hr_ir_logs.id DESC
+        `, [req.user.id]);
+        res.status(200).json(rows);
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to retrieve IR logs: ' + err.message });
+    }
+});
+
+app.post('/api/legal/hr/ir', authenticateToken, async (req, res) => {
+    try {
+        const { employeeId, incidentType, description, actionTaken, status } = req.body;
+        const [result] = await pool.query(`
+            INSERT INTO hr_ir_logs (lawyer_id, employee_id, incident_type, description, action_taken, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+        `, [req.user.id, employeeId, incidentType || 'Disciplinary', description, actionTaken, status || 'Open']);
+
+        res.status(201).json({ success: true, message: 'IR record created successfully.', logId: result.insertId });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to save IR log: ' + err.message });
+    }
+});
+
 // ============================================================================
 // 6. CASH RECEIPT JOURNAL (CRJ) ACCOUNTING SUBSYSTEM
 // ============================================================================
@@ -693,7 +947,7 @@ app.get('/api/legal/financials', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
-// 9. TRUST ACCOUNTING & LEDGER BALANCES SUBSYSTEM (WITH WHATSAPP NOTIFICATIONS)
+// 9. TRUST ACCOUNTING & LEDGER BALANCES SUBSYSTEM
 // ============================================================================
 
 app.get('/api/legal/trust', authenticateToken, async (req, res) => {
@@ -726,19 +980,24 @@ app.post('/api/legal/trust/deposit', authenticateToken, async (req, res) => {
             WHERE matters.id = ?
         `, [matterId]);
 
+        let trustMsg = "";
         if (matterRows.length > 0 && matterRows[0].phone) {
             const client = matterRows[0];
             const firmName = req.user.firmName || 'Legal Counsel';
-            let trustMsg = "";
             if (transactionType === 'deposit') {
                 trustMsg = `Dear ${client.full_name}, your trust account has been updated with a deposit of R ${parseFloat(amount).toFixed(2)} at ${firmName}.`;
             } else {
                 trustMsg = `Dear ${client.full_name}, an amount of R ${parseFloat(amount).toFixed(2)} has been removed from your trust account at ${firmName}.`;
             }
-            await sendWhatsAppMessage(client.phone, trustMsg);
+            await sendSmsApi(client.phone, trustMsg);
         }
 
-        res.status(201).json({ success: true, message: 'Trust ledger transaction posted successfully and client notified via WhatsApp.', ledgerId: result.insertId });
+        res.status(201).json({ 
+            success: true, 
+            message: 'Trust ledger transaction posted successfully and client notified via SMS.', 
+            ledgerId: result.insertId,
+            notificationMessage: trustMsg 
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -809,7 +1068,7 @@ app.post('/api/legal/ai/analyze', authenticateToken, async (req, res) => {
             [req.user.id, matterId, `AI_${actionType ? actionType.toUpperCase() : 'ANALYSIS'}_Output.txt`, 'text/plain', '2.5 KB', base64Output]
         );
 
-    res.status(200).json({ success: true, message: 'AI Legal Engine executed and saved to vault.', output });
+        res.status(200).json({ success: true, message: 'AI Legal Engine executed and saved to vault.', output });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -827,7 +1086,6 @@ app.get('/api/legal/whatsapp/qr', authenticateToken, (req, res) => {
     });
 });
 
-// Dedicated manual SMS endpoint: Sends ONLY an SMS via MTN v3 API and does NOT trigger WhatsApp
 app.post('/api/legal/sms/send', authenticateToken, async (req, res) => {
     try {
         const { phone, message } = req.body;
@@ -838,7 +1096,7 @@ app.post('/api/legal/sms/send', authenticateToken, async (req, res) => {
         await sendSmsApi(phone, message);
         res.status(200).json({ 
             success: true, 
-            message: 'SMS dispatched successfully via MTN SMS v3 API (WhatsApp not triggered).' 
+            message: 'SMS dispatched successfully via MTN SMS v3 API.' 
         });
     } catch (err) {
         res.status(500).json({ error: 'Failed to send SMS: ' + err.message });
@@ -862,6 +1120,6 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log(`============================================================`);
     console.log(`L3 Legal System Backend Engine running on port ${PORT}`);
-    console.log(`Secure Messaging Socket & MTN SMS v3 Gateway active.`);
+    console.log(`Secure Messaging Socket, MTN SMS v3 Gateway, HR & Job Board active.`);
     console.log(`============================================================`);
 });
