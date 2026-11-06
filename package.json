@@ -1,18 +1,21 @@
 {
   "name": "rsa-legal-practice-suite",
-  "version": "4.2.5",
-  "description": "Enterprise Legal Practice Management & Automated Compliance Suite for South African Law Firms",
+  "version": "4.3.0",
+  "description": "Enterprise Legal Practice Management & Automated Compliance Suite with WhatsApp & MTN SMS Integration",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
   "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.5",
+    "axios": "^1.6.8",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "jsonwebtoken": "^9.0.2",
-    "mysql2": "^3.9.2"
+    "mysql2": "^3.9.2",
+    "pino": "^8.19.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"
