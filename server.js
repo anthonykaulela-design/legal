@@ -225,7 +225,7 @@ async function sendSmsApi(phone, message) {
     
     try {
         console.log(`[MTN SMS v3] Dispatching SMS to +${formattedPhone} using Key: ${SMS_API_KEY.substring(0, 6)}...`);
-        await axios.post('https://api.mtn.com/v3/messages/sms', {
+        await axios.post('https://api.mtn.com/v3/sms/messages/sms/outbound', {
             to: `+${formattedPhone}`,
             message: message,
             sender: 'L3Legal'
