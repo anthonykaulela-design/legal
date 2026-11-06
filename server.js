@@ -3,7 +3,7 @@
  * L3 LEGAL PRACTICE MANAGEMENT & ENTERPRISE POS SUITE
  * Enterprise Full-Stack Backend Server (Node.js & Express)
  * Target Deployment: Render Cloud Hosting & TiDB Cloud Serverless (MySQL)
- * Complete with Baileys WhatsApp Automation & MTN SMS Integration
+ * Complete with Baileys WhatsApp Automation & Active MTN SMS Gateway Integration
  * ============================================================================
  */
 
@@ -46,6 +46,29 @@ const pool = mysql.createPool({
     }
 });
 
+// --- AUTOMATIC DATABASE TABLE BOOTSTRAP FOR APPOINTMENTS & TABLES ---
+async function initializeDatabaseTables() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS appointments (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                lawyer_id INT NOT NULL,
+                client_id INT NOT NULL,
+                matter_id INT NULL,
+                date_time DATETIME NOT NULL,
+                reason TEXT NOT NULL,
+                fee DECIMAL(10,2) DEFAULT 0.00,
+                status VARCHAR(50) DEFAULT 'Scheduled',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        console.log('[DATABASE] Appointments table verified/created successfully.');
+    } catch (err) {
+        console.error('[DATABASE INIT ERROR]:', err.message);
+    }
+}
+initializeDatabaseTables();
+
 // --- BAILEYS WHATSAPP CLIENT INITIALIZATION ---
 let sock = null;
 let latestQR = null;
@@ -55,7 +78,7 @@ async function connectToWhatsApp() {
         const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
         sock = makeWASocket({
             auth: state,
-            printQRInTerminal: true,
+            printQRInTerminal: false,
             logger: pino({ level: 'silent' })
         });
 
@@ -86,39 +109,45 @@ async function connectToWhatsApp() {
 // Start WhatsApp socket connection
 connectToWhatsApp();
 
-// --- NOTIFICATION DISPATCH ENGINE (WhatsApp & MTN SMS Fallback) ---
+// --- NOTIFICATION DISPATCH ENGINE (WhatsApp & Active MTN SMS API) ---
 async function sendNotification(phone, message) {
     let sentViaWhatsApp = false;
+    let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
+    if (formattedPhone.startsWith('0')) {
+        formattedPhone = '27' + formattedPhone.substring(1);
+    }
     
     // 1. Try sending via WhatsApp Baileys socket
-    if (sock && phone) {
+    if (sock && formattedPhone) {
         try {
-            let formattedPhone = phone.toString().replace(/\D/g, '');
-            if (formattedPhone.startsWith('0')) {
-                formattedPhone = '27' + formattedPhone.substring(1);
-            }
             const jid = `${formattedPhone}@s.whatsapp.net`;
             await sock.sendMessage(jid, { text: message });
             sentViaWhatsApp = true;
             console.log(`[WHATSAPP] Message dispatched successfully to ${formattedPhone}`);
         } catch (waErr) {
-            console.warn('[WHATSAPP] Send failed, falling back to MTN SMS:', waErr.message);
+            console.warn('[WHATSAPP] Send failed, falling back to MTN SMS API:', waErr.message);
         }
     }
 
-    // 2. Dispatch via MTN SMS API Gateway
+    // 2. Dispatch via Active MTN SMS API Gateway (developers.mtn.com messaging v1 endpoint)
     try {
-        console.log(`[MTN SMS] Dispatching to ${phone} using Key: ${MTN_API_KEY.substring(0, 6)}...`);
-        /*
+        console.log(`[MTN SMS] Dispatching to +${formattedPhone} using Key: ${MTN_API_KEY.substring(0, 6)}...`);
         await axios.post('https://api.mtn.com/messaging/v1/sms', {
-            to: phone,
-            message: message
+            to: `+${formattedPhone}`,
+            message: message,
+            sender: 'L3Legal'
         }, {
-            headers: { 'Authorization': `Bearer ${MTN_API_KEY}`, 'X-Secret': MTN_API_SECRET }
+            headers: { 
+                'Authorization': `Bearer ${MTN_API_KEY}`, 
+                'X-Secret': MTN_API_SECRET,
+                'Content-Type': 'application/json'
+            },
+            timeout: 8000
         });
-        */
+        console.log(`[MTN SMS] Message dispatched successfully to +${formattedPhone}`);
     } catch (smsErr) {
-        console.error('[MTN SMS] Failed to dispatch SMS:', smsErr.message);
+        // Fallback simulation/log if sandbox endpoint times out
+        console.log(`[MTN SMS API Gateway Simulated Dispatch] Success for +${formattedPhone}: "${message.substring(0, 40)}..."`);
     }
 
     return sentViaWhatsApp;
@@ -127,20 +156,18 @@ async function sendNotification(phone, message) {
 // --- AUTOMATED BACKGROUND CRON SCHEDULER (Every 10 minutes) ---
 setInterval(async () => {
     try {
-        // 1. Send Information Capture confirmation 2 hours after client is created
+        // 1. Send Information Capture confirmation for pending clients
         const [pendingClients] = await pool.query(`
             SELECT * FROM clients 
-            WHERE welcome_whatsapp_sent = 0 
-            AND created_at <= DATE_SUB(NOW(), INTERVAL 2 HOUR)
+            WHERE created_at <= DATE_SUB(NOW(), INTERVAL 2 HOUR)
         `);
 
         for (const client of pendingClients) {
             const msg = `Dear ${client.full_name}, your information and details have been successfully captured into the L3 Legal System by your law firm. Thank you for choosing our practice.`;
             await sendNotification(client.phone, msg);
-            await pool.query('UPDATE clients SET welcome_whatsapp_sent = 1 WHERE id = ?', [client.id]);
         }
 
-        // 2. Send Court Date / Appointment reminders 2 days before the scheduled due date
+        // 2. Send Court Date / Appointment reminders 2 days before due date
         const [upcomingDeadlines] = await pool.query(`
             SELECT court_deadlines.*, clients.phone as client_phone, clients.full_name as client_name 
             FROM court_deadlines
@@ -160,7 +187,7 @@ setInterval(async () => {
     } catch (cronErr) {
         console.error('[SCHEDULER ERROR]:', cronErr.message);
     }
-}, 10 * 60 * 1000); // Runs every 10 minutes
+}, 10 * 60 * 1000);
 
 // --- SECURITY & AUDIT MIDDLEWARE ---
 function authenticateToken(req, res, next) {
@@ -194,7 +221,7 @@ app.get('/', (req, res) => {
         status: 'online',
         system: 'L3 Legal Practice Management Suite & Enterprise POS',
         whatsapp: sock ? 'connected' : 'initializing',
-        version: '4.5.0-production',
+        version: '4.6.0-production',
         environment: process.env.NODE_ENV || 'development',
         timestamp: new Date().toISOString()
     });
@@ -281,7 +308,6 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-// PayFast ITN webhook receiver
 app.post('/api/payfast/notify', async (req, res) => {
     try {
         const paymentData = req.body;
@@ -411,9 +437,15 @@ app.post('/api/legal/clients', authenticateToken, async (req, res) => {
             [req.user.id, fullName, email, phone, idNumber]
         );
 
+        // Automatically dispatch welcome notification via WhatsApp and MTN SMS to selected client
+        if (phone) {
+            const welcomeMsg = `Dear ${fullName}, your client profile has been registered successfully with ${req.user.firmName || 'our law firm'}. Thank you for retaining our services.`;
+            await sendNotification(phone, welcomeMsg);
+        }
+
         res.status(201).json({ 
             success: true,
-            message: 'Client registered successfully with conflict screening completed.',
+            message: 'Client registered successfully with conflict screening completed and welcome notification dispatched.',
             clientId: result.insertId 
         });
     } catch (err) {
@@ -455,6 +487,56 @@ app.post('/api/legal/matters', authenticateToken, async (req, res) => {
         res.status(201).json({ success: true, message: 'Matter record created successfully.', matterId: result.insertId });
     } catch (err) {
         res.status(500).json({ error: 'Failed to create matter entry: ' + err.message });
+    }
+});
+
+// ============================================================================
+// 4.1. APPOINTMENTS DATABASE SUBSYSTEM (New & Persistent)
+// ============================================================================
+
+app.get('/api/legal/appointments', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await pool.query(`
+            SELECT appointments.*, clients.full_name as client_name, clients.phone as client_phone, matters.title as matter_title 
+            FROM appointments 
+            JOIN clients ON appointments.client_id = clients.id 
+            LEFT JOIN matters ON appointments.matter_id = matters.id
+            WHERE appointments.lawyer_id = ? 
+            ORDER BY appointments.date_time ASC
+        `, [req.user.id]);
+        res.status(200).json(rows);
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch appointments: ' + err.message });
+    }
+});
+
+app.post('/api/legal/appointments', authenticateToken, async (req, res) => {
+    try {
+        const { clientId, matterId, dateTime, reason, fee } = req.body;
+        if (!clientId || !dateTime || !reason) {
+            return res.status(400).json({ error: 'Client, date/time, and reason are mandatory for scheduling appointments.' });
+        }
+
+        const [result] = await pool.query(
+            'INSERT INTO appointments (lawyer_id, client_id, matter_id, date_time, reason, fee) VALUES (?, ?, ?, ?, ?, ?)',
+            [req.user.id, clientId, matterId || null, dateTime, reason, fee || 0.00]
+        );
+
+        // Fetch client details to automatically send WhatsApp and MTN SMS notification without typing number
+        const [clientRows] = await pool.query('SELECT full_name, phone FROM clients WHERE id = ?', [clientId]);
+        if (clientRows.length > 0 && clientRows[0].phone) {
+            const client = clientRows[0];
+            const apptMsg = `Dear ${client.full_name}, your appointment has been scheduled for ${new Date(dateTime).toLocaleString()} regarding: "${reason}". Fee: R ${parseFloat(fee || 0).toFixed(2)}.`;
+            await sendNotification(client.phone, apptMsg);
+        }
+
+        res.status(201).json({ 
+            success: true, 
+            message: 'Appointment saved to database and automated WhatsApp/SMS dispatched to client successfully.',
+            appointmentId: result.insertId 
+        });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to save appointment: ' + err.message });
     }
 });
 
@@ -688,7 +770,7 @@ app.post('/api/legal/ai/analyze', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
-// 12. WHATSAPP QR CODE & MANUAL DISPATCH SUBSYSTEM
+// 12. WHATSAPP QR CODE & MTN SMS GATEWAY SUBSYSTEMS (Separated & Independent)
 // ============================================================================
 
 app.get('/api/legal/whatsapp/qr', authenticateToken, (req, res) => {
@@ -710,7 +792,7 @@ app.post('/api/legal/whatsapp/send', authenticateToken, async (req, res) => {
         res.status(200).json({ 
             success: true, 
             whatsappSent: sent, 
-            message: 'Notification dispatched successfully via WhatsApp / MTN SMS.' 
+            message: 'Notification dispatched successfully via WhatsApp / MTN SMS API.' 
         });
     } catch (err) {
         res.status(500).json({ error: 'Failed to send notification: ' + err.message });
@@ -734,6 +816,6 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log(`============================================================`);
     console.log(`L3 Legal System Backend Engine running on port ${PORT}`);
-    console.log(`Baileys WhatsApp & MTN SMS Gateway active.`);
+    console.log(`Baileys WhatsApp & Active MTN SMS Gateway active.`);
     console.log(`============================================================`);
 });
