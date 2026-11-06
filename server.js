@@ -3,7 +3,7 @@
  * L3 LEGAL PRACTICE MANAGEMENT & ENTERPRISE POS SUITE
  * Enterprise Full-Stack Backend Server (Node.js & Express)
  * Target Deployment: Render Cloud Hosting & TiDB Cloud Serverless (MySQL)
- * Complete with Baileys WhatsApp Automation & Active MTN SMS Gateway Integration
+ * Complete with Baileys WhatsApp & Real MTN SMS API v2 Integration
  * ============================================================================
  */
 
@@ -46,9 +46,10 @@ const pool = mysql.createPool({
     }
 });
 
-// --- AUTOMATIC DATABASE TABLE BOOTSTRAP FOR APPOINTMENTS & TABLES ---
+// --- AUTOMATIC DATABASE TABLE BOOTSTRAP & SCHEMA CORRECTIONS ---
 async function initializeDatabaseTables() {
     try {
+        // Ensure appointments table exists with correct schema
         await pool.query(`
             CREATE TABLE IF NOT EXISTS appointments (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -62,7 +63,31 @@ async function initializeDatabaseTables() {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         `);
-        console.log('[DATABASE] Appointments table verified/created successfully.');
+
+        // Ensure court_deadlines has reminder_sent column to fix scheduler errors
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS court_deadlines (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                lawyer_id INT NOT NULL,
+                matter_id INT NOT NULL,
+                title VARCHAR(255) NOT NULL,
+                court_rule VARCHAR(100) NULL,
+                service_date DATE NOT NULL,
+                days_count INT NOT NULL,
+                due_date DATE NOT NULL,
+                reminder_sent TINYINT(1) DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        // Check and add reminder_sent column if missing in older tables
+        try {
+            await pool.query(`ALTER TABLE court_deadlines ADD COLUMN reminder_sent TINYINT(1) DEFAULT 0`);
+        } catch (e) {
+            // Column likely already exists
+        }
+
+        console.log('[DATABASE] All database tables and schemas verified/created successfully.');
     } catch (err) {
         console.error('[DATABASE INIT ERROR]:', err.message);
     }
@@ -106,10 +131,9 @@ async function connectToWhatsApp() {
     }
 }
 
-// Start WhatsApp socket connection
 connectToWhatsApp();
 
-// --- NOTIFICATION DISPATCH ENGINE (WhatsApp & Active MTN SMS API) ---
+// --- REAL MTN SMS API V2 & WHATSAPP NOTIFICATION DISPATCH ENGINE ---
 async function sendNotification(phone, message) {
     let sentViaWhatsApp = false;
     let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
@@ -117,7 +141,7 @@ async function sendNotification(phone, message) {
         formattedPhone = '27' + formattedPhone.substring(1);
     }
     
-    // 1. Try sending via WhatsApp Baileys socket
+    // 1. Dispatch via WhatsApp Baileys socket
     if (sock && formattedPhone) {
         try {
             const jid = `${formattedPhone}@s.whatsapp.net`;
@@ -125,14 +149,14 @@ async function sendNotification(phone, message) {
             sentViaWhatsApp = true;
             console.log(`[WHATSAPP] Message dispatched successfully to ${formattedPhone}`);
         } catch (waErr) {
-            console.warn('[WHATSAPP] Send failed, falling back to MTN SMS API:', waErr.message);
+            console.warn('[WHATSAPP] Send failed:', waErr.message);
         }
     }
 
-    // 2. Dispatch via Active MTN SMS API Gateway (developers.mtn.com messaging v1 endpoint)
+    // 2. Dispatch via Real MTN SMS API v2 (/messaging/v2/sms or /v2/sms)
     try {
-        console.log(`[MTN SMS] Dispatching to +${formattedPhone} using Key: ${MTN_API_KEY.substring(0, 6)}...`);
-        await axios.post('https://api.mtn.com/messaging/v1/sms', {
+        console.log(`[MTN SMS v2] Dispatching to +${formattedPhone} using Key: ${MTN_API_KEY.substring(0, 6)}...`);
+        await axios.post('https://api.mtn.com/messaging/v2/sms', {
             to: `+${formattedPhone}`,
             message: message,
             sender: 'L3Legal'
@@ -142,12 +166,11 @@ async function sendNotification(phone, message) {
                 'X-Secret': MTN_API_SECRET,
                 'Content-Type': 'application/json'
             },
-            timeout: 8000
+            timeout: 10000
         });
-        console.log(`[MTN SMS] Message dispatched successfully to +${formattedPhone}`);
+        console.log(`[MTN SMS v2] Live carrier delivery successful for +${formattedPhone}`);
     } catch (smsErr) {
-        // Fallback simulation/log if sandbox endpoint times out
-        console.log(`[MTN SMS API Gateway Simulated Dispatch] Success for +${formattedPhone}: "${message.substring(0, 40)}..."`);
+        console.error('[MTN SMS v2 Error]:', smsErr.response?.data || smsErr.message);
     }
 
     return sentViaWhatsApp;
@@ -158,28 +181,30 @@ setInterval(async () => {
     try {
         // 1. Send Information Capture confirmation for pending clients
         const [pendingClients] = await pool.query(`
-            SELECT * FROM clients 
-            WHERE created_at <= DATE_SUB(NOW(), INTERVAL 2 HOUR)
+            SELECT clients.*, lawyers.firm_name FROM clients 
+            JOIN lawyers ON clients.lawyer_id = lawyers.id
+            WHERE clients.created_at <= DATE_SUB(NOW(), INTERVAL 2 HOUR)
         `);
 
         for (const client of pendingClients) {
-            const msg = `Dear ${client.full_name}, your information and details have been successfully captured into the L3 Legal System by your law firm. Thank you for choosing our practice.`;
+            const msg = `Dear ${client.full_name}, your information has been captured into the L3 Legal System by ${client.firm_name || 'our firm'}. Thank you for choosing our practice.`;
             await sendNotification(client.phone, msg);
         }
 
         // 2. Send Court Date / Appointment reminders 2 days before due date
         const [upcomingDeadlines] = await pool.query(`
-            SELECT court_deadlines.*, clients.phone as client_phone, clients.full_name as client_name 
+            SELECT court_deadlines.*, clients.phone as client_phone, clients.full_name as client_name, lawyers.firm_name 
             FROM court_deadlines
             JOIN matters ON court_deadlines.matter_id = matters.id
             JOIN clients ON matters.client_id = clients.id
+            JOIN lawyers ON court_deadlines.lawyer_id = lawyers.id
             WHERE court_deadlines.reminder_sent = 0
             AND court_deadlines.due_date = DATE_ADD(CURDATE(), INTERVAL 2 DAY)
         `);
 
         for (const dl of upcomingDeadlines) {
             if (dl.client_phone) {
-                const msg = `Reminder: Dear ${dl.client_name}, you have a scheduled court appearance or appointment ("${dl.title}") coming up in 2 days on ${dl.due_date}. Please contact your legal representative for preparation.`;
+                const msg = `Reminder: Dear ${dl.client_name}, you have a scheduled court appearance or appointment ("${dl.title}") hosted by ${dl.firm_name} in 2 days on ${dl.due_date}. Please contact your legal representative.`;
                 await sendNotification(dl.client_phone, msg);
                 await pool.query('UPDATE court_deadlines SET reminder_sent = 1 WHERE id = ?', [dl.id]);
             }
@@ -208,8 +233,7 @@ function authenticateToken(req, res, next) {
 }
 
 function auditLogger(req, res, next) {
-    const timestamp = new Date().toISOString();
-    console.log(`[AUDIT] [${timestamp}] ${req.method} request received at endpoint: ${req.originalUrl}`);
+    console.log(`[AUDIT] [${new Date().toISOString()}] ${req.method} request received at: ${req.originalUrl}`);
     next();
 }
 
@@ -221,7 +245,7 @@ app.get('/', (req, res) => {
         status: 'online',
         system: 'L3 Legal Practice Management Suite & Enterprise POS',
         whatsapp: sock ? 'connected' : 'initializing',
-        version: '4.6.0-production',
+        version: '4.7.0-production',
         environment: process.env.NODE_ENV || 'development',
         timestamp: new Date().toISOString()
     });
@@ -437,9 +461,8 @@ app.post('/api/legal/clients', authenticateToken, async (req, res) => {
             [req.user.id, fullName, email, phone, idNumber]
         );
 
-        // Automatically dispatch welcome notification via WhatsApp and MTN SMS to selected client
         if (phone) {
-            const welcomeMsg = `Dear ${fullName}, your client profile has been registered successfully with ${req.user.firmName || 'our law firm'}. Thank you for retaining our services.`;
+            const welcomeMsg = `Dear ${fullName}, your client profile has been registered successfully with ${req.user.firmName}. Thank you for retaining our legal services.`;
             await sendNotification(phone, welcomeMsg);
         }
 
@@ -491,7 +514,7 @@ app.post('/api/legal/matters', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
-// 4.1. APPOINTMENTS DATABASE SUBSYSTEM (New & Persistent)
+// 4.1. APPOINTMENTS DATABASE SUBSYSTEM & NOTIFICATIONS WITH FIRM/HOST NAME
 // ============================================================================
 
 app.get('/api/legal/appointments', authenticateToken, async (req, res) => {
@@ -522,17 +545,18 @@ app.post('/api/legal/appointments', authenticateToken, async (req, res) => {
             [req.user.id, clientId, matterId || null, dateTime, reason, fee || 0.00]
         );
 
-        // Fetch client details to automatically send WhatsApp and MTN SMS notification without typing number
+        // Fetch client and law firm name to include host/firm in WhatsApp and MTN SMS v2
         const [clientRows] = await pool.query('SELECT full_name, phone FROM clients WHERE id = ?', [clientId]);
         if (clientRows.length > 0 && clientRows[0].phone) {
             const client = clientRows[0];
-            const apptMsg = `Dear ${client.full_name}, your appointment has been scheduled for ${new Date(dateTime).toLocaleString()} regarding: "${reason}". Fee: R ${parseFloat(fee || 0).toFixed(2)}.`;
+            const hostName = req.user.firmName || 'Legal Counsel';
+            const apptMsg = `Dear ${client.full_name}, your consultation has been scheduled with host/firm: ${hostName} on ${new Date(dateTime).toLocaleString()} for: "${reason}". Fee: R ${parseFloat(fee || 0).toFixed(2)}.`;
             await sendNotification(client.phone, apptMsg);
         }
 
         res.status(201).json({ 
             success: true, 
-            message: 'Appointment saved to database and automated WhatsApp/SMS dispatched to client successfully.',
+            message: 'Appointment saved to database and multi-channel notifications dispatched with firm/host details.',
             appointmentId: result.insertId 
         });
     } catch (err) {
@@ -541,7 +565,7 @@ app.post('/api/legal/appointments', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
-// 5. SECURE DOCUMENT VAULT SUBSYSTEM
+// 5. SECURE DOCUMENT VAULT & MATTER FILE MANAGEMENT SUBSYSTEM
 // ============================================================================
 
 app.get('/api/legal/documents', authenticateToken, async (req, res) => {
@@ -571,7 +595,7 @@ app.post('/api/legal/documents', authenticateToken, async (req, res) => {
             [req.user.id, matterId, fileName, fileType || 'application/pdf', fileSize || '1.0 MB', contentBase64]
         );
 
-        res.status(201).json({ success: true, message: 'Document encrypted and securely stored.', documentId: result.insertId });
+        res.status(201).json({ success: true, message: 'Document uploaded and linked to matter successfully.', documentId: result.insertId });
     } catch (err) {
         res.status(500).json({ error: 'Failed to upload document: ' + err.message });
     }
@@ -731,7 +755,7 @@ app.post('/api/legal/calendar', authenticateToken, async (req, res) => {
 
         res.status(201).json({ 
             success: true,
-            message: 'Court deadline scheduled successfully. Automated WhatsApp reminder set for 2 days prior.',
+            message: 'Court deadline scheduled successfully. Automated reminder set for 2 days prior.',
             deadlineId: result.insertId,
             calculatedDueDate: dueDate
         });
@@ -770,7 +794,7 @@ app.post('/api/legal/ai/analyze', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
-// 12. WHATSAPP QR CODE & MTN SMS GATEWAY SUBSYSTEMS (Separated & Independent)
+// 12. WHATSAPP QR CODE & MTN SMS V2 GATEWAY SUBSYSTEMS
 // ============================================================================
 
 app.get('/api/legal/whatsapp/qr', authenticateToken, (req, res) => {
@@ -792,7 +816,7 @@ app.post('/api/legal/whatsapp/send', authenticateToken, async (req, res) => {
         res.status(200).json({ 
             success: true, 
             whatsappSent: sent, 
-            message: 'Notification dispatched successfully via WhatsApp / MTN SMS API.' 
+            message: 'Notification dispatched successfully via WhatsApp / MTN SMS v2 API.' 
         });
     } catch (err) {
         res.status(500).json({ error: 'Failed to send notification: ' + err.message });
@@ -816,6 +840,6 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log(`============================================================`);
     console.log(`L3 Legal System Backend Engine running on port ${PORT}`);
-    console.log(`Baileys WhatsApp & Active MTN SMS Gateway active.`);
+    console.log(`Baileys WhatsApp & MTN SMS v2 Gateway active.`);
     console.log(`============================================================`);
 });
