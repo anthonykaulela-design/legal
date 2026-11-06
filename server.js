@@ -152,7 +152,7 @@ async function sendNotification(phone, message) {
 
     // 2. Dispatch via National SMS v3 API Gateway (/messaging/v3/sms) restricted to RSA carriers (Throws real production errors)
     console.log(`[National SMS v3] Dispatching to +${formattedPhone} using Key: ${SMS_API_KEY.substring(0, 6)}...`);
-    const smsResponse = await axios.post('https://api.gateway.co.za/messaging/v3/sms', {
+    const smsResponse = await axios.post('https://api.mtn.com/v3/sms', {
         to: `+${formattedPhone}`,
         message: message,
         sender: 'L3Legal'
