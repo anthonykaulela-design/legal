@@ -130,7 +130,7 @@ async function connectMessagingSocket() {
 
 connectMessagingSocket();
 
-// --- NOTIFICATION DISPATCH ENGINE (Secure Socket & National SMS v3 API) ---
+// --- NOTIFICATION DISPATCH ENGINE (Secure Socket & National SMS v3 API - Direct Production Mode) ---
 async function sendNotification(phone, message) {
     let sentViaSocket = false;
     let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
@@ -150,25 +150,21 @@ async function sendNotification(phone, message) {
         }
     }
 
-    // 2. Dispatch via National SMS v3 API Gateway (/messaging/v3/sms) restricted to RSA carriers
-    try {
-        console.log(`[National SMS v3] Dispatching to +${formattedPhone} using Key: ${SMS_API_KEY.substring(0, 6)}...`);
-        await axios.post('https://api.gateway.co.za/messaging/v3/sms', {
-            to: `+${formattedPhone}`,
-            message: message,
-            sender: 'L3Legal'
-        }, {
-            headers: { 
-                'Authorization': `Bearer ${SMS_API_KEY}`, 
-                'X-Secret': SMS_API_SECRET,
-                'Content-Type': 'application/json'
-            },
-            timeout: 10000
-        });
-        console.log(`[National SMS v3] Live RSA carrier delivery successful for +${formattedPhone}`);
-    } catch (smsErr) {
-        console.log(`[National SMS v3 Gateway Simulated Dispatch / Fallback] Success for +${formattedPhone}`);
-    }
+    // 2. Dispatch via National SMS v3 API Gateway (/messaging/v3/sms) restricted to RSA carriers (Throws real production errors)
+    console.log(`[National SMS v3] Dispatching to +${formattedPhone} using Key: ${SMS_API_KEY.substring(0, 6)}...`);
+    const smsResponse = await axios.post('https://api.gateway.co.za/messaging/v3/sms', {
+        to: `+${formattedPhone}`,
+        message: message,
+        sender: 'L3Legal'
+    }, {
+        headers: { 
+            'Authorization': `Bearer ${SMS_API_KEY}`, 
+            'X-Secret': SMS_API_SECRET,
+            'Content-Type': 'application/json'
+        },
+        timeout: 10000
+    });
+    console.log(`[National SMS v3] Live RSA carrier delivery successful for +${formattedPhone}`);
 
     return sentViaSocket;
 }
@@ -781,7 +777,7 @@ app.post('/api/legal/ai/analyze', authenticateToken, async (req, res) => {
             [req.user.id, matterId, `AI_${actionType ? actionType.toUpperCase() : 'ANALYSIS'}_Output.txt`, 'text/plain', '2.5 KB', base64Output]
         );
 
-        res.status(200).json({ success: true, message: 'AI Legal Engine executed and saved to vault.', output });
+    res.status(200).json({ success: true, message: 'AI Legal Engine executed and saved to vault.', output });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -810,7 +806,7 @@ app.post('/api/legal/whatsapp/send', authenticateToken, async (req, res) => {
         res.status(200).json({ 
             success: true, 
             socketSent: sent, 
-            message: 'Notification dispatched successfully via Socket / National SMS v3 API.' 
+            message: 'Notification dispatched successfully via Socket / SMS v3 API.' 
         });
     } catch (err) {
         res.status(500).json({ error: 'Failed to send notification: ' + err.message });
