@@ -191,7 +191,7 @@ setInterval(async () => {
         `);
 
         for (const client of pendingClients) {
-            const msg = `Dear ${client.full_name}, your information has been captured into the L3 Legal System by ${client.firm_name || 'our firm'}. Thank you for choosing our practice.`;
+            const msg = `Dear ${client.full_name}, your information has been captured into the system by ${client.firm_name || 'our firm'}. Thank you for choosing our practice.`;
             await sendWhatsAppMessage(client.phone, msg);
         }
 
@@ -719,7 +719,6 @@ app.post('/api/legal/trust/deposit', authenticateToken, async (req, res) => {
             [req.user.id, matterId, transactionType || 'deposit', amount, description || 'Trust account movement']
         );
 
-        // Fetch client details for WhatsApp notification regarding trust account update
         const [matterRows] = await pool.query(`
             SELECT matters.title, clients.full_name, clients.phone 
             FROM matters 
@@ -829,7 +828,7 @@ app.get('/api/legal/whatsapp/qr', authenticateToken, (req, res) => {
 });
 
 // Dedicated manual SMS endpoint: Sends ONLY an SMS via MTN v3 API and does NOT trigger WhatsApp
-app.post('/api/legal/whatsapp/send', authenticateToken, async (req, res) => {
+app.post('/api/legal/sms/send', authenticateToken, async (req, res) => {
     try {
         const { phone, message } = req.body;
         if (!phone || !message) {
