@@ -130,28 +130,41 @@ async function connectMessagingSocket() {
 
 connectMessagingSocket();
 
-// --- NOTIFICATION DISPATCH ENGINE (Secure Socket & MTN SMS v3 API - Direct Production Mode) ---
-async function sendNotification(phone, message) {
-    let sentViaSocket = false;
+// --- SEPARATED ROUTING DISPATCH ENGINES ---
+
+/**
+ * Dispatch WhatsApp message only (used for automated system events: client registration, appointments, trust updates).
+ */
+async function sendWhatsAppMessage(phone, message) {
     let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
     if (formattedPhone.startsWith('0')) {
         formattedPhone = '27' + formattedPhone.substring(1);
     }
     
-    // 1. Dispatch via secure messaging socket (with safe optional checks)
     if (sock && formattedPhone) {
         try {
             const jid = `${formattedPhone}@s.whatsapp.net`;
             await sock.sendMessage(jid, { text: message });
-            sentViaSocket = true;
-            console.log(`[MESSAGING SOCKET] Message dispatched successfully to ${formattedPhone}`);
+            console.log(`[MESSAGING SOCKET] WhatsApp message dispatched successfully to ${formattedPhone}`);
+            return true;
         } catch (waErr) {
-            console.warn('[MESSAGING SOCKET] Send failed:', waErr.message);
+            console.warn('[MESSAGING SOCKET] WhatsApp send failed:', waErr.message);
+            return false;
         }
     }
+    return false;
+}
 
-    // 2. Dispatch via MTN SMS v3 API Gateway (https://api.mtn.com/v1/messages/sms)
-    console.log(`[MTN SMS v3] Dispatching to +${formattedPhone} using Key: ${SMS_API_KEY.substring(0, 6)}...`);
+/**
+ * Dispatch SMS only via MTN SMS v3 API (used strictly for manual user-initiated SMS sending).
+ */
+async function sendSmsApi(phone, message) {
+    let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
+    if (formattedPhone.startsWith('0')) {
+        formattedPhone = '27' + formattedPhone.substring(1);
+    }
+    
+    console.log(`[MTN SMS v3] Dispatching SMS only to +${formattedPhone} using Key: ${SMS_API_KEY.substring(0, 6)}...`);
     const smsResponse = await axios.post('https://api.mtn.com/v1/messages/sms', {
         to: `+${formattedPhone}`,
         message: message,
@@ -164,9 +177,8 @@ async function sendNotification(phone, message) {
         },
         timeout: 10000
     });
-    console.log(`[MTN SMS v3] Live carrier delivery successful for +${formattedPhone}`);
-
-    return sentViaSocket;
+    console.log(`[MTN SMS v3] Live carrier SMS delivery successful for +${formattedPhone}`);
+    return true;
 }
 
 // --- AUTOMATED BACKGROUND CRON SCHEDULER (Every 10 minutes) ---
@@ -180,7 +192,7 @@ setInterval(async () => {
 
         for (const client of pendingClients) {
             const msg = `Dear ${client.full_name}, your information has been captured into the L3 Legal System by ${client.firm_name || 'our firm'}. Thank you for choosing our practice.`;
-            await sendNotification(client.phone, msg);
+            await sendWhatsAppMessage(client.phone, msg);
         }
 
         const [upcomingDeadlines] = await pool.query(`
@@ -196,7 +208,7 @@ setInterval(async () => {
         for (const dl of upcomingDeadlines) {
             if (dl.client_phone) {
                 const msg = `Reminder: Dear ${dl.client_name}, you have a scheduled court appearance or appointment ("${dl.title}") hosted by ${dl.firm_name} in 2 days on ${dl.due_date}. Please contact your legal representative.`;
-                await sendNotification(dl.client_phone, msg);
+                await sendWhatsAppMessage(dl.client_phone, msg);
                 await pool.query('UPDATE court_deadlines SET reminder_sent = 1 WHERE id = ?', [dl.id]);
             }
         }
@@ -453,8 +465,8 @@ app.post('/api/legal/clients', authenticateToken, async (req, res) => {
         );
 
         if (phone) {
-            const welcomeMsg = `Dear ${fullName}, your client profile has been registered successfully with ${req.user.firmName}. Thank you for retaining our legal services.`;
-            await sendNotification(phone, welcomeMsg);
+            const welcomeMsg = `Dear ${fullName}, your client profile has been captured into the system by ${req.user.firmName}. Thank you for retaining our legal services.`;
+            await sendWhatsAppMessage(phone, welcomeMsg);
         }
 
         res.status(201).json({ 
@@ -505,7 +517,7 @@ app.post('/api/legal/matters', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
-// 4.1. APPOINTMENTS DATABASE SUBSYSTEM & NOTIFICATIONS WITH FIRM/HOST NAME
+// 4.1. APPOINTMENTS DATABASE SUBSYSTEM & WHATSAPP NOTIFICATIONS WITH FIRM/HOST NAME
 // ============================================================================
 
 app.get('/api/legal/appointments', authenticateToken, async (req, res) => {
@@ -540,13 +552,13 @@ app.post('/api/legal/appointments', authenticateToken, async (req, res) => {
         if (clientRows.length > 0 && clientRows[0].phone) {
             const client = clientRows[0];
             const hostName = req.user.firmName || 'Legal Counsel';
-            const apptMsg = `Dear ${client.full_name}, your consultation has been scheduled with host/firm: ${hostName} on ${new Date(dateTime).toLocaleString()} for: "${reason}". Fee: R ${parseFloat(fee || 0).toFixed(2)}.`;
-            await sendNotification(client.phone, apptMsg);
+            const apptMsg = `Dear ${client.full_name}, you have an appointment on ${new Date(dateTime).toLocaleString()} at ${hostName} for: "${reason}". Fee: R ${parseFloat(fee || 0).toFixed(2)}.`;
+            await sendWhatsAppMessage(client.phone, apptMsg);
         }
 
         res.status(201).json({ 
             success: true, 
-            message: 'Appointment saved to database and multi-channel notifications dispatched with firm/host details.',
+            message: 'Appointment saved to database and WhatsApp notification dispatched with firm/host details.',
             appointmentId: result.insertId 
         });
     } catch (err) {
@@ -681,7 +693,7 @@ app.get('/api/legal/financials', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
-// 9. TRUST ACCOUNTING & LEDGER BALANCES SUBSYSTEM
+// 9. TRUST ACCOUNTING & LEDGER BALANCES SUBSYSTEM (WITH WHATSAPP NOTIFICATIONS)
 // ============================================================================
 
 app.get('/api/legal/trust', authenticateToken, async (req, res) => {
@@ -706,7 +718,28 @@ app.post('/api/legal/trust/deposit', authenticateToken, async (req, res) => {
             'INSERT INTO trust_ledgers (lawyer_id, matter_id, transaction_type, amount, description) VALUES (?, ?, ?, ?, ?)',
             [req.user.id, matterId, transactionType || 'deposit', amount, description || 'Trust account movement']
         );
-        res.status(201).json({ success: true, message: 'Trust ledger transaction posted successfully.', ledgerId: result.insertId });
+
+        // Fetch client details for WhatsApp notification regarding trust account update
+        const [matterRows] = await pool.query(`
+            SELECT matters.title, clients.full_name, clients.phone 
+            FROM matters 
+            JOIN clients ON matters.client_id = clients.id 
+            WHERE matters.id = ?
+        `, [matterId]);
+
+        if (matterRows.length > 0 && matterRows[0].phone) {
+            const client = matterRows[0];
+            const firmName = req.user.firmName || 'Legal Counsel';
+            let trustMsg = "";
+            if (transactionType === 'deposit') {
+                trustMsg = `Dear ${client.full_name}, your trust account has been updated with a deposit of R ${parseFloat(amount).toFixed(2)} at ${firmName}.`;
+            } else {
+                trustMsg = `Dear ${client.full_name}, an amount of R ${parseFloat(amount).toFixed(2)} has been removed from your trust account at ${firmName}.`;
+            }
+            await sendWhatsAppMessage(client.phone, trustMsg);
+        }
+
+        res.status(201).json({ success: true, message: 'Trust ledger transaction posted successfully and client notified via WhatsApp.', ledgerId: result.insertId });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -784,7 +817,7 @@ app.post('/api/legal/ai/analyze', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
-// 12. QR CODE & MTN SMS v3 GATEWAY SUBSYSTEMS
+// 12. WHATSAPP QR & DEDICATED SMS v3 GATEWAY SUBSYSTEMS
 // ============================================================================
 
 app.get('/api/legal/whatsapp/qr', authenticateToken, (req, res) => {
@@ -795,6 +828,7 @@ app.get('/api/legal/whatsapp/qr', authenticateToken, (req, res) => {
     });
 });
 
+// Dedicated manual SMS endpoint: Sends ONLY an SMS via MTN v3 API and does NOT trigger WhatsApp
 app.post('/api/legal/whatsapp/send', authenticateToken, async (req, res) => {
     try {
         const { phone, message } = req.body;
@@ -802,14 +836,13 @@ app.post('/api/legal/whatsapp/send', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'Phone number and message are required.' });
         }
 
-        const sent = await sendNotification(phone, message);
+        await sendSmsApi(phone, message);
         res.status(200).json({ 
             success: true, 
-            socketSent: sent, 
-            message: 'Notification dispatched successfully via Socket / MTN SMS v3 API.' 
+            message: 'SMS dispatched successfully via MTN SMS v3 API (WhatsApp not triggered).' 
         });
     } catch (err) {
-        res.status(500).json({ error: 'Failed to send notification: ' + err.message });
+        res.status(500).json({ error: 'Failed to send SMS: ' + err.message });
     }
 });
 
