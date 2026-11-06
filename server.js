@@ -3,7 +3,7 @@
  * L3 LEGAL PRACTICE MANAGEMENT & ENTERPRISE POS SUITE
  * Enterprise Full-Stack Backend Server (Node.js & Express)
  * Target Deployment: Render Cloud Hosting & TiDB Cloud Serverless (MySQL)
- * Complete with Encrypted Session Socket & National SMS v3 Gateway Integration
+ * Complete with Encrypted Session Socket & MTN SMS v3 Gateway Integration
  * ============================================================================
  */
 
@@ -130,7 +130,7 @@ async function connectMessagingSocket() {
 
 connectMessagingSocket();
 
-// --- NOTIFICATION DISPATCH ENGINE (Secure Socket & National SMS v3 API - Direct Production Mode) ---
+// --- NOTIFICATION DISPATCH ENGINE (Secure Socket & MTN SMS v3 API - Direct Production Mode) ---
 async function sendNotification(phone, message) {
     let sentViaSocket = false;
     let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
@@ -150,9 +150,9 @@ async function sendNotification(phone, message) {
         }
     }
 
-    // 2. Dispatch via National SMS v3 API Gateway (/messaging/v3/sms) restricted to RSA carriers (Throws real production errors)
-    console.log(`[National SMS v3] Dispatching to +${formattedPhone} using Key: ${SMS_API_KEY.substring(0, 6)}...`);
-    const smsResponse = await axios.post('https://api.mtn.com/v3/sms', {
+    // 2. Dispatch via MTN SMS v3 API Gateway (https://api.mtn.com/v1/messages/sms)
+    console.log(`[MTN SMS v3] Dispatching to +${formattedPhone} using Key: ${SMS_API_KEY.substring(0, 6)}...`);
+    const smsResponse = await axios.post('https://api.mtn.com/v1/messages/sms', {
         to: `+${formattedPhone}`,
         message: message,
         sender: 'L3Legal'
@@ -164,7 +164,7 @@ async function sendNotification(phone, message) {
         },
         timeout: 10000
     });
-    console.log(`[National SMS v3] Live RSA carrier delivery successful for +${formattedPhone}`);
+    console.log(`[MTN SMS v3] Live carrier delivery successful for +${formattedPhone}`);
 
     return sentViaSocket;
 }
@@ -784,7 +784,7 @@ app.post('/api/legal/ai/analyze', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
-// 12. QR CODE & NATIONAL SMS V3 GATEWAY SUBSYSTEMS
+// 12. QR CODE & MTN SMS v3 GATEWAY SUBSYSTEMS
 // ============================================================================
 
 app.get('/api/legal/whatsapp/qr', authenticateToken, (req, res) => {
@@ -806,7 +806,7 @@ app.post('/api/legal/whatsapp/send', authenticateToken, async (req, res) => {
         res.status(200).json({ 
             success: true, 
             socketSent: sent, 
-            message: 'Notification dispatched successfully via Socket / SMS v3 API.' 
+            message: 'Notification dispatched successfully via Socket / MTN SMS v3 API.' 
         });
     } catch (err) {
         res.status(500).json({ error: 'Failed to send notification: ' + err.message });
@@ -830,6 +830,6 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log(`============================================================`);
     console.log(`L3 Legal System Backend Engine running on port ${PORT}`);
-    console.log(`Secure Messaging Socket & National SMS v3 Gateway active.`);
+    console.log(`Secure Messaging Socket & MTN SMS v3 Gateway active.`);
     console.log(`============================================================`);
 });
