@@ -3,7 +3,7 @@
  * L3 LEGAL PRACTICE MANAGEMENT & ENTERPRISE POS SUITE
  * Enterprise Full-Stack Backend Server (Node.js & Express)
  * Target Deployment: Render Cloud Hosting & TiDB Cloud Serverless (MySQL)
- * Complete with Encrypted Session Socket, MTN SMS v3 Gateway, Wati Chatbot, HR & Job Board
+ * Complete with Baileys Outbound Messaging, MTN SMS v3 Gateway, Wati Chatbot Webhook, HR & Job Board
  * ============================================================================
  */
 
@@ -27,7 +27,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'rsa_legal_practice_management_jwt_
 const SMS_API_KEY = process.env.SMS_API_KEY || 'OMvq5cRASIB8MvjvtAyRLWc3NAfXPpA4';
 const SMS_API_SECRET = process.env.SMS_API_SECRET || 'ToBrwfnGNkXihClz';
 
-// Wati Configuration from Environment Variables
+// Wati Configuration for Inbound Chatbot Webhook
 const WATI_BASE_URL = process.env.WATI_BASE_URL || 'https://live-mt-server.wati.io/api/ext/v3';
 const WATI_API_KEY = process.env.WATI_API_KEY || 'wati_6e5fbaa1-dcf7-4cbb-a32e-258dd3846187.fGeOwsHeqgiy8g66i0LTJkHn--7ws722hRPBgOkZumDSJrWMIGPHy45UGKlwJ22G6Dtca1LY8dHyewJZHpGlzg850F6xuSueacPwH10GZpzqfx19oAAXOxUQTiPbt584';
 
@@ -99,7 +99,7 @@ async function initializeDatabaseTables() {
                 salary_range VARCHAR(150) NOT NULL,
                 benefits TEXT NULL,
                 how_to_apply TEXT NOT NULL,
-                required_documentation TEXT NOT NULL,
+                required_documentation VARCHAR(255) NOT NULL,
                 closing_date DATE NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -160,7 +160,7 @@ async function initializeDatabaseTables() {
 }
 initializeDatabaseTables();
 
-// --- SECURE MESSAGING SOCKET CLIENT INITIALIZATION ---
+// --- SECURE BAILEYS MESSAGING SOCKET CLIENT INITIALIZATION ---
 let sock = null;
 let latestQR = null;
 
@@ -177,29 +177,29 @@ async function connectMessagingSocket() {
             const { connection, lastDisconnect, qr } = update;
             if (qr) {
                 latestQR = qr;
-                console.log('[MESSAGING SOCKET] New QR Code generated for scanning.');
+                console.log('[BAILEYS SOCKET] New QR Code generated for scanning.');
             }
             if (connection === 'close') {
                 const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-                console.log('[MESSAGING SOCKET] Connection closed. Reconnecting:', shouldReconnect);
+                console.log('[BAILEYS SOCKET] Connection closed. Reconnecting:', shouldReconnect);
                 if (shouldReconnect) {
                     connectMessagingSocket();
                 }
             } else if (connection === 'open') {
                 latestQR = null;
-                console.log('[MESSAGING SOCKET] Connection opened successfully.');
+                console.log('[BAILEYS SOCKET] Connection opened successfully via Baileys.');
             }
         });
 
         sock.ev.on('creds.update', saveCreds);
     } catch (err) {
-        console.error('[MESSAGING SOCKET] Failed to initialize socket:', err.message);
+        console.error('[BAILEYS SOCKET] Failed to initialize socket:', err.message);
     }
 }
 
 connectMessagingSocket();
 
-// --- WATI WHATSAPP & CHATBOT HELPER ---
+// --- WATI CHATBOT HELPER (For Inbound Chatbot Webhook Replies) ---
 
 async function sendWatiTextMessage(phone, message) {
     try {
@@ -224,7 +224,7 @@ async function sendWatiTextMessage(phone, message) {
     }
 }
 
-// --- DUAL DISPATCH NOTIFICATION ENGINE (WHATSAPP & SMS) ---
+// --- WHATSAPP MESSAGING EXCLUSIVELY VIA BAILEYS FOR CLIENTS ---
 
 async function sendWhatsAppMessage(phone, message) {
     let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
@@ -232,22 +232,18 @@ async function sendWhatsAppMessage(phone, message) {
         formattedPhone = '27' + formattedPhone.substring(1);
     }
     
-    // Try Wati first if configured, else fallback to Baileys socket
-    if (WATI_API_KEY) {
-        const res = await sendWatiTextMessage(formattedPhone, message);
-        if (res.success) return true;
-    }
-
     if (sock && formattedPhone) {
         try {
             const jid = `${formattedPhone}@s.whatsapp.net`;
             await sock.sendMessage(jid, { text: message });
+            console.log(`[BAILEYS SOCKET] WhatsApp message dispatched successfully to +${formattedPhone}`);
             return true;
         } catch (waErr) {
-            console.warn('[WHATSAPP SOCKET] WhatsApp send failed:', waErr.message);
+            console.warn('[BAILEYS SOCKET] WhatsApp send failed:', waErr.message);
             return false;
         }
     }
+    console.warn('[BAILEYS SOCKET] Socket not connected or phone missing.');
     return false;
 }
 
@@ -352,10 +348,10 @@ app.get('/', (req, res) => {
     res.status(200).json({
         status: 'online',
         system: 'L3 Legal Practice Management Suite & Enterprise POS',
-        messagingSocket: sock?.user ? 'connected' : 'initializing',
-        watiChatbot: 'active',
+        baileysSocket: sock?.user ? 'connected' : 'initializing',
+        watiChatbotWebhook: 'active',
         smsGateway: 'active',
-        version: '4.9.0-production',
+        version: '5.1.0-production',
         timestamp: new Date().toISOString()
     });
 });
@@ -365,7 +361,7 @@ app.get('/api/health', async (req, res) => {
         const connection = await pool.getConnection();
         await connection.ping();
         connection.release();
-        res.status(200).json({ database: 'connected', wati: 'active', smsGateway: 'active', status: 'healthy' });
+        res.status(200).json({ database: 'connected', baileys: sock?.user ? 'active' : 'connecting', watiWebhook: 'active', smsGateway: 'active', status: 'healthy' });
     } catch (dbError) {
         res.status(500).json({ database: 'disconnected', error: dbError.message });
     }
@@ -825,7 +821,7 @@ app.post('/api/legal/hr/ir', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
-// 6. ACCOUNTING JOURNALS (CRJ & CPJ) & TRUST ACCOUNTING
+// 6. ACCOUNTING JOURNALS & TRUST ACCOUNTING
 // ============================================================================
 
 app.get('/api/legal/crj', authenticateToken, async (req, res) => {
@@ -879,7 +875,7 @@ app.post('/api/legal/trust/deposit', authenticateToken, async (req, res) => {
             await dispatchDualNotification(client.phone, trustMsg);
         }
 
-        res.status(201).json({ success: true, message: 'Trust ledger transaction posted successfully and client notified.', ledgerId: result.insertId });
+        res.status(201).json({ success: true, message: 'Trust ledger transaction posted successfully and client notified via Baileys & SMS.', ledgerId: result.insertId });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -944,7 +940,7 @@ app.post('/api/legal/ai/analyze', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
-// 9. WATI CHATBOT WEBHOOK & SMS GATEWAY SUBSYSTEMS
+// 9. WATI CHATBOT WEBHOOK & BAILEYS / SMS GATEWAY SUBSYSTEMS
 // ============================================================================
 
 // Wati Inbound Chatbot Webhook Endpoint
@@ -1013,6 +1009,6 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log(`============================================================`);
     console.log(`L3 Legal System Backend Engine running on port ${PORT}`);
-    console.log(`Wati Chatbot Webhook, MTN SMS v3, HR & Job Board active.`);
+    console.log(`Baileys Client Messaging, Wati Webhook, MTN SMS v3 active.`);
     console.log(`============================================================`);
 });
