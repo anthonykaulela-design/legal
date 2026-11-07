@@ -261,13 +261,14 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
     }
     
     try {
-        console.log(`[MTN SMS v1] Requesting OAuth access token from https://api.mtn.com/v1/oauth/access token...`);
+        console.log(`[MTN SMS v1] Requesting OAuth access token from https://api.mtn.com/v1/oauth/access_token...`);
         const credentials = Buffer.from(`${SMS_API_KEY}:${SMS_API_SECRET}`).toString('base64');
         const transactionId = crypto.randomUUID();
         
         let accessToken = null;
         try {
-            const tokenRes = await axios.post('https://api.mtn.com/v1/oauth/access token', 'grant_type=client_credentials', {
+            // Corrected endpoint path without space
+            const tokenRes = await axios.post('https://api.mtn.com/v1/oauth/access_token', 'grant_type=client_credentials', {
                 headers: {
                     'Authorization': `Basic ${credentials}`,
                     'Content-Type': 'application/x-www-form-urlencoded',
@@ -277,7 +278,6 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
             });
             accessToken = tokenRes.data.access_token || tokenRes.data.accessToken;
         } catch (tokenErr) {
-            // Fallback token endpoint variant
             const fallbackTokenRes = await axios.post('https://api.mtn.com/v1/oauth/token', 'grant_type=client_credentials', {
                 headers: {
                     'Authorization': `Basic ${credentials}`,
@@ -291,7 +291,6 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
 
         console.log(`[MTN SMS v1] OAuth token acquired. Dispatching outbound SMS to +${formattedPhone}`);
 
-        // Payload matching exact MTN SMS v1 specification[cite: 40, 41, 42]
         const mtnPayload = {
             senderAddress: customSenderAddress || 'L3Legal',
             cpAddress: 'L3_Chambers',
@@ -395,7 +394,7 @@ app.get('/', (req, res) => {
         baileysSocket: sock?.user ? 'connected' : 'initializing',
         watiChatbotWebhook: 'active',
         smsGateway: 'active (MTN SMS v1 Spec)',
-        version: '5.6.0-production',
+        version: '5.6.1-production',
         timestamp: new Date().toISOString()
     });
 });
