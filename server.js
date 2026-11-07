@@ -3,7 +3,7 @@
  * L3 LEGAL PRACTICE MANAGEMENT & ENTERPRISE POS SUITE
  * Enterprise Full-Stack Backend Server (Node.js & Express)
  * Target Deployment: Render Cloud Hosting & TiDB Cloud Serverless (MySQL)
- * Complete with Baileys Outbound Messaging, MTN SMS v3 Gateway (OAuth), Wati Chatbot Webhook
+ * Complete with Baileys Outbound Messaging, MTN SMS v3 Gateway, Wati Webhook
  * ============================================================================
  */
 
@@ -252,7 +252,7 @@ async function sendWhatsAppMessage(phone, message) {
     return false;
 }
 
-// --- MTN SMS v3 GATEWAY (OAuth Handshake with Production/Sandbox Fallback) ---
+// --- MTN SMS v3 GATEWAY (Strictly matching official specification & curl contract)[cite: 26, 38, 40] ---
 async function sendSmsApi(phone, message) {
     let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
     if (formattedPhone.startsWith('0')) {
@@ -274,7 +274,7 @@ async function sendSmsApi(phone, message) {
             });
             accessToken = tokenRes.data.access_token;
         } catch (prodTokenErr) {
-            // Fallback to Sandbox OAuth endpoint if production fails
+            // Fallback to Sandbox OAuth endpoint if production handshake fails
             const sandboxTokenRes = await axios.post('https://sandbox.api.mtn.com/v3/oauth/token', 'grant_type=client_credentials', {
                 headers: {
                     'Authorization': `Basic ${credentials}`,
@@ -287,8 +287,9 @@ async function sendSmsApi(phone, message) {
 
         console.log(`[MTN SMS v3] OAuth token acquired. Dispatching SMS to +${formattedPhone}`);
 
+        // Payload structured precisely to match MTN v3 specification & curl parameters[cite: 28, 29, 30, 31, 38]
         const mtnPayload = {
-            senderAddress: 'L3Legal',
+            senderAddress: 'MTN',
             receiverAddress: [formattedPhone],
             message: message,
             clientCorrelatorId: 'l3_legal_' + Date.now(),
@@ -390,7 +391,7 @@ app.get('/', (req, res) => {
         baileysSocket: sock?.user ? 'connected' : 'initializing',
         watiChatbotWebhook: 'active',
         smsGateway: 'active',
-        version: '5.3.0-production',
+        version: '5.4.0-production',
         timestamp: new Date().toISOString()
     });
 });
@@ -1046,6 +1047,6 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log(`============================================================`);
     console.log(`L3 Legal System Backend Engine running on port ${PORT}`);
-    console.log(`Baileys Client Messaging, Wati Webhook, MTN SMS v3 (OAuth) active.`);
+    console.log(`Baileys Client Messaging, Wati Webhook, MTN SMS v3 active.`);
     console.log(`============================================================`);
 });
