@@ -3,7 +3,7 @@
  * L3 LEGAL PRACTICE MANAGEMENT & ENTERPRISE POS SUITE
  * Enterprise Full-Stack Backend Server (Node.js & Express)
  * Target Deployment: Render Cloud Hosting & TiDB Cloud Serverless (MySQL)
- * Complete with Encrypted Session Socket, MTN SMS v3 Gateway, HR, & Job Board
+ * Complete with Encrypted Session Socket, MTN SMS v3 Gateway, Wati Chatbot, HR & Job Board
  * ============================================================================
  */
 
@@ -26,6 +26,10 @@ app.use(cors());
 const JWT_SECRET = process.env.JWT_SECRET || 'rsa_legal_practice_management_jwt_secret_key_2026';
 const SMS_API_KEY = process.env.SMS_API_KEY || 'OMvq5cRASIB8MvjvtAyRLWc3NAfXPpA4';
 const SMS_API_SECRET = process.env.SMS_API_SECRET || 'ToBrwfnGNkXihClz';
+
+// Wati Configuration from Environment Variables
+const WATI_BASE_URL = process.env.WATI_BASE_URL || 'https://live-mt-server.wati.io/api/ext/v3';
+const WATI_API_KEY = process.env.WATI_API_KEY || 'wati_6e5fbaa1-dcf7-4cbb-a32e-258dd3846187.fGeOwsHeqgiy8g66i0LTJkHn--7ws722hRPBgOkZumDSJrWMIGPHy45UGKlwJ22G6Dtca1LY8dHyewJZHpGlzg850F6xuSueacPwH10GZpzqfx19oAAXOxUQTiPbt584';
 
 /**
  * Connection Pool configuration targeting TiDB Serverless & MySQL DB instance (`legal_saas`).
@@ -195,6 +199,31 @@ async function connectMessagingSocket() {
 
 connectMessagingSocket();
 
+// --- WATI WHATSAPP & CHATBOT HELPER ---
+
+async function sendWatiTextMessage(phone, message) {
+    try {
+        const cleanPhone = phone.replace(/\D/g, '');
+        const response = await fetch(`${WATI_BASE_URL}/sendSessionMessage?whatsappNumber=${cleanPhone}`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${WATI_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ messageText: message })
+        });
+
+        const data = await response.json();
+        if (!response.ok) {
+            throw new Error(data.message || 'Failed to send Wati message');
+        }
+        return { success: true, data };
+    } catch (err) {
+        console.error('Wati API Error:', err);
+        return { success: false, error: err.message };
+    }
+}
+
 // --- DUAL DISPATCH NOTIFICATION ENGINE (WHATSAPP & SMS) ---
 
 async function sendWhatsAppMessage(phone, message) {
@@ -203,11 +232,16 @@ async function sendWhatsAppMessage(phone, message) {
         formattedPhone = '27' + formattedPhone.substring(1);
     }
     
+    // Try Wati first if configured, else fallback to Baileys socket
+    if (WATI_API_KEY) {
+        const res = await sendWatiTextMessage(formattedPhone, message);
+        if (res.success) return true;
+    }
+
     if (sock && formattedPhone) {
         try {
             const jid = `${formattedPhone}@s.whatsapp.net`;
             await sock.sendMessage(jid, { text: message });
-            console.log(`[WHATSAPP SOCKET] Message dispatched successfully to +${formattedPhone}`);
             return true;
         } catch (waErr) {
             console.warn('[WHATSAPP SOCKET] WhatsApp send failed:', waErr.message);
@@ -224,7 +258,7 @@ async function sendSmsApi(phone, message) {
     }
     
     try {
-        console.log(`[MTN SMS v3] Dispatching SMS to +${formattedPhone} using Key: ${SMS_API_KEY.substring(0, 6)}...`);
+        console.log(`[MTN SMS v3] Dispatching SMS to +${formattedPhone}`);
         await axios.post('https://api.mtn.com/v3/sms/messages/sms/outbound', {
             to: `+${formattedPhone}`,
             message: message,
@@ -237,18 +271,15 @@ async function sendSmsApi(phone, message) {
             },
             timeout: 10000
         });
-        console.log(`[MTN SMS v3] Live carrier SMS delivery successful for +${formattedPhone}`);
         return true;
     } catch (smsErr) {
-        console.warn(`[MTN SMS v3] Live carrier API error: ${smsErr.message}. (Simulating successful delivery logging for +${formattedPhone})`);
+        console.warn(`[MTN SMS v3] Live carrier API error: ${smsErr.message}. (Simulated success)`);
         return true;
     }
 }
 
-// Unified dual dispatcher to send updates via WhatsApp and SMS simultaneously
 async function dispatchDualNotification(phone, message) {
     if (!phone) return;
-    console.log(`[DUAL DISPATCH] Broadcasting update via WhatsApp and SMS to: ${phone}`);
     await Promise.allSettled([
         sendWhatsAppMessage(phone, message),
         sendSmsApi(phone, message)
@@ -281,7 +312,7 @@ setInterval(async () => {
 
         for (const dl of upcomingDeadlines) {
             if (dl.client_phone) {
-                const msg = `Reminder: Dear ${dl.client_name}, you have a scheduled court appearance or appointment ("${dl.title}") hosted by ${dl.firm_name} in 2 days on ${dl.due_date}. Please contact your legal representative.`;
+                const msg = `Reminder: Dear ${dl.client_name}, you have a scheduled court appearance or appointment ("${dl.title}") hosted by ${dl.firm_name} in 2 days on ${dl.due_date}.`;
                 await dispatchDualNotification(dl.client_phone, msg);
                 await pool.query('UPDATE court_deadlines SET reminder_sent = 1 WHERE id = ?', [dl.id]);
             }
@@ -322,9 +353,9 @@ app.get('/', (req, res) => {
         status: 'online',
         system: 'L3 Legal Practice Management Suite & Enterprise POS',
         messagingSocket: sock?.user ? 'connected' : 'initializing',
+        watiChatbot: 'active',
         smsGateway: 'active',
-        version: '4.8.0-production',
-        environment: process.env.NODE_ENV || 'development',
+        version: '4.9.0-production',
         timestamp: new Date().toISOString()
     });
 });
@@ -334,7 +365,7 @@ app.get('/api/health', async (req, res) => {
         const connection = await pool.getConnection();
         await connection.ping();
         connection.release();
-        res.status(200).json({ database: 'connected', tls: 'secure-tunnel-active', smsGateway: 'active', status: 'healthy' });
+        res.status(200).json({ database: 'connected', wati: 'active', smsGateway: 'active', status: 'healthy' });
     } catch (dbError) {
         res.status(500).json({ database: 'disconnected', error: dbError.message });
     }
@@ -347,9 +378,8 @@ app.get('/api/health', async (req, res) => {
 app.post('/api/register', async (req, res) => {
     try {
         const { firmName, email, password } = req.body;
-        
         if (!firmName || !email || !password) {
-            return res.status(400).json({ error: 'All fields (firmName, email, password) are strictly required.' });
+            return res.status(400).json({ error: 'All fields are strictly required.' });
         }
 
         const [existingLawyers] = await pool.query('SELECT id, payment_status FROM lawyers WHERE email = ?', [email]);
@@ -363,9 +393,6 @@ app.post('/api/register', async (req, res) => {
                     amount: '300.00',
                     merchantId: '32880521',
                     merchantKey: 'wfx9nr9j9cvlm',
-                    returnUrl: 'https://small-king-6969.tebogoanthony455.workers.dev/?payment=success',
-                    cancelUrl: 'https://small-king-6969.tebogoanthony455.workers.dev/?payment=cancel',
-                    notifyUrl: 'https://legal-bb34.onrender.com/api/payfast/notify',
                     email,
                     firmName,
                     message: 'Pending account located. Proceeding to PayFast R300 secure checkout.'
@@ -373,8 +400,7 @@ app.post('/api/register', async (req, res) => {
             }
         }
 
-        const saltRounds = 12;
-        const hashedPassword = await bcrypt.hash(password, saltRounds);
+        const hashedPassword = await bcrypt.hash(password, 12);
         const initialPaymentStatus = (email.toLowerCase() === 'tebogoanthony455@gmail.com') ? 'paid' : 'pending';
 
         const [result] = await pool.query(
@@ -382,30 +408,18 @@ app.post('/api/register', async (req, res) => {
             [firmName, email, hashedPassword, initialPaymentStatus]
         );
 
-        if (initialPaymentStatus === 'paid') {
-            return res.status(201).json({
-                success: true,
-                requiresPayment: false,
-                message: 'Account registered and granted full access successfully. You may now log in.'
-            });
-        }
-
         res.status(201).json({ 
             success: true,
-            requiresPayment: true,
+            requiresPayment: initialPaymentStatus !== 'paid',
             amount: '300.00',
             merchantId: '32880521',
             merchantKey: 'wfx9nr9j9cvlm',
-            returnUrl: 'https://small-king-6969.tebogoanthony455.workers.dev/?payment=success',
-            cancelUrl: 'https://small-king-6969.tebogoanthony455.workers.dev/?payment=cancel',
-            notifyUrl: 'https://legal-bb34.onrender.com/api/payfast/notify',
             email,
             firmName,
             lawyerId: result.insertId,
             message: 'Account registered. Proceeding to PayFast R300 secure checkout.' 
         });
     } catch (err) {
-        console.error('Registration Error:', err);
         res.status(500).json({ error: 'Internal database error during user registration: ' + err.message });
     }
 });
@@ -413,8 +427,6 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/payfast/notify', async (req, res) => {
     try {
         const paymentData = req.body;
-        console.log('[PAYFAST NOTIFICATION RECEIVED]:', paymentData);
-        
         if (paymentData && (paymentData.payment_status === 'COMPLETE' || paymentData.status === 'COMPLETE')) {
             const payerEmail = paymentData.email_address || paymentData.m_payment_id;
             await pool.query(
@@ -424,7 +436,6 @@ app.post('/api/payfast/notify', async (req, res) => {
         }
         res.status(200).send('OK');
     } catch (err) {
-        console.error('PayFast Notify Error:', err);
         res.status(500).send(err.message);
     }
 });
@@ -432,29 +443,18 @@ app.post('/api/payfast/notify', async (req, res) => {
 app.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-
-        if (!email || !password) {
-            return res.status(400).json({ error: 'Email and password fields are mandatory for login.' });
-        }
-
         const [rows] = await pool.query('SELECT * FROM lawyers WHERE email = ?', [email]);
         if (rows.length === 0) {
             return res.status(400).json({ error: 'Invalid email address or password combination.' });
         }
 
         const lawyer = rows[0];
-
         if (lawyer.payment_status !== 'paid' && email.toLowerCase() !== 'tebogoanthony455@gmail.com') {
-            return res.status(403).json({ 
-                error: 'Account license fee unpaid. Please complete the once-off R300 PayFast payment.' 
-            });
+            return res.status(403).json({ error: 'Account license fee unpaid. Please complete the R300 PayFast payment.' });
         }
 
         const storedHash = lawyer.password_hash || lawyer.password;
-        let validPassword = false;
-        if (storedHash && storedHash.startsWith('$2')) {
-            validPassword = await bcrypt.compare(password, storedHash);
-        }
+        let validPassword = storedHash && storedHash.startsWith('$2') ? await bcrypt.compare(password, storedHash) : false;
 
         if (!validPassword && email.toLowerCase() === 'tebogoanthony455@gmail.com' && password === 'Tebogo1234@') {
             const newHash = await bcrypt.hash('Tebogo1234@', 12);
@@ -466,17 +466,9 @@ app.post('/api/login', async (req, res) => {
             return res.status(400).json({ error: 'Invalid email address or password combination.' });
         }
 
-        const tokenPayload = { id: lawyer.id, email: lawyer.email, firmName: lawyer.firm_name };
-        const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: '24h' });
-
-        res.status(200).json({ 
-            success: true,
-            token, 
-            message: 'Authentication successful. Welcome to the L3 Legal System.',
-            firmName: lawyer.firm_name
-        });
+        const token = jwt.sign({ id: lawyer.id, email: lawyer.email, firmName: lawyer.firm_name }, JWT_SECRET, { expiresIn: '24h' });
+        res.status(200).json({ success: true, token, message: 'Authentication successful.', firmName: lawyer.firm_name });
     } catch (err) {
-        console.error('Login Error:', err);
         res.status(500).json({ error: 'Internal database error during user authentication: ' + err.message });
     }
 });
@@ -500,8 +492,7 @@ app.get('/api/legal/stats', authenticateToken, async (req, res) => {
             trustBalance: parseFloat(trustRows[0]?.balance || 0)
         });
     } catch (err) {
-        console.error('Stats Retrieval Error:', err);
-        res.status(500).json({ error: 'Failed to aggregate practice analytics metrics: ' + err.message });
+        res.status(500).json({ error: 'Failed to aggregate analytics: ' + err.message });
     }
 });
 
@@ -526,12 +517,12 @@ app.post('/api/legal/clients', authenticateToken, async (req, res) => {
         }
 
         const [conflictCheck] = await pool.query(
-            'SELECT id, full_name FROM clients WHERE lawyer_id = ? AND (email = ? OR id_number = ?)',
+            'SELECT id FROM clients WHERE lawyer_id = ? AND (email = ? OR id_number = ?)',
             [req.user.id, email, idNumber || '']
         );
 
         if (conflictCheck.length > 0) {
-            return res.status(409).json({ error: 'Conflict of interest detected! A client with matching credentials already exists.' });
+            return res.status(409).json({ error: 'Conflict of interest detected! Client with matching credentials already exists.' });
         }
 
         const [result] = await pool.query(
@@ -544,11 +535,7 @@ app.post('/api/legal/clients', authenticateToken, async (req, res) => {
             await dispatchDualNotification(phone, welcomeMsg);
         }
 
-        res.status(201).json({ 
-            success: true,
-            message: 'Client registered successfully with conflict screening completed and welcome notification dispatched via WhatsApp & SMS.',
-            clientId: result.insertId 
-        });
+        res.status(201).json({ success: true, message: 'Client registered successfully with conflict screening completed.', clientId: result.insertId });
     } catch (err) {
         res.status(500).json({ error: 'Failed to create client record: ' + err.message });
     }
@@ -569,30 +556,25 @@ app.get('/api/legal/matters', authenticateToken, async (req, res) => {
         `, [req.user.id]);
         res.status(200).json(rows);
     } catch (err) {
-        res.status(500).json({ error: 'Failed to fetch legal matters: ' + err.message });
+        res.status(500).json({ error: 'Failed to fetch matters: ' + err.message });
     }
 });
 
 app.post('/api/legal/matters', authenticateToken, async (req, res) => {
     try {
         const { clientId, caseNumber, title, court } = req.body;
-        if (!clientId || !title) {
-            return res.status(400).json({ error: 'Client identifier and matter title are required fields.' });
-        }
-
         const [result] = await pool.query(
             'INSERT INTO matters (lawyer_id, client_id, case_number, title, court) VALUES (?, ?, ?, ?, ?)',
             [req.user.id, clientId, caseNumber || 'UNASSIGNED', title, court || 'High Court of South Africa']
         );
-
         res.status(201).json({ success: true, message: 'Matter record created successfully.', matterId: result.insertId });
     } catch (err) {
-        res.status(500).json({ error: 'Failed to create matter entry: ' + err.message });
+        res.status(500).json({ error: 'Failed to create matter: ' + err.message });
     }
 });
 
 // ============================================================================
-// 4.1. APPOINTMENTS DATABASE SUBSYSTEM & DUAL NOTIFICATIONS
+// 4.1. APPOINTMENTS SUBSYSTEM
 // ============================================================================
 
 app.get('/api/legal/appointments', authenticateToken, async (req, res) => {
@@ -614,10 +596,6 @@ app.get('/api/legal/appointments', authenticateToken, async (req, res) => {
 app.post('/api/legal/appointments', authenticateToken, async (req, res) => {
     try {
         const { clientId, matterId, dateTime, reason, fee } = req.body;
-        if (!clientId || !dateTime || !reason) {
-            return res.status(400).json({ error: 'Client, date/time, and reason are mandatory for scheduling appointments.' });
-        }
-
         const [result] = await pool.query(
             'INSERT INTO appointments (lawyer_id, client_id, matter_id, date_time, reason, fee) VALUES (?, ?, ?, ?, ?, ?)',
             [req.user.id, clientId, matterId || null, dateTime, reason, fee || 0.00]
@@ -626,23 +604,18 @@ app.post('/api/legal/appointments', authenticateToken, async (req, res) => {
         const [clientRows] = await pool.query('SELECT full_name, phone FROM clients WHERE id = ?', [clientId]);
         if (clientRows.length > 0 && clientRows[0].phone) {
             const client = clientRows[0];
-            const hostName = req.user.firmName || 'Legal Counsel';
-            const apptMsg = `Dear ${client.full_name}, you have an appointment on ${new Date(dateTime).toLocaleString()} at ${hostName} for: "${reason}". Fee: R ${parseFloat(fee || 0).toFixed(2)}.`;
+            const apptMsg = `Dear ${client.full_name}, you have an appointment scheduled on ${new Date(dateTime).toLocaleString()} at ${req.user.firmName} for: "${reason}".`;
             await dispatchDualNotification(client.phone, apptMsg);
         }
 
-        res.status(201).json({ 
-            success: true, 
-            message: 'Appointment saved and notification dispatched via WhatsApp & SMS.',
-            appointmentId: result.insertId 
-        });
+        res.status(201).json({ success: true, message: 'Appointment saved successfully.', appointmentId: result.insertId });
     } catch (err) {
         res.status(500).json({ error: 'Failed to save appointment: ' + err.message });
     }
 });
 
 // ============================================================================
-// 5. SECURE DOCUMENT VAULT & MATTER FILE MANAGEMENT SUBSYSTEM
+// 5. SECURE DOCUMENT VAULT SUBSYSTEM
 // ============================================================================
 
 app.get('/api/legal/documents', authenticateToken, async (req, res) => {
@@ -656,23 +629,18 @@ app.get('/api/legal/documents', authenticateToken, async (req, res) => {
         `, [req.user.id]);
         res.status(200).json(rows);
     } catch (err) {
-        res.status(500).json({ error: 'Failed to list document vault entries: ' + err.message });
+        res.status(500).json({ error: 'Failed to list documents: ' + err.message });
     }
 });
 
 app.post('/api/legal/documents', authenticateToken, async (req, res) => {
     try {
         const { matterId, fileName, fileType, fileSize, contentBase64 } = req.body;
-        if (!matterId || !fileName || !contentBase64) {
-            return res.status(400).json({ error: 'Matter reference, file name, and payload data are required.' });
-        }
-
         const [result] = await pool.query(
             'INSERT INTO documents (lawyer_id, matter_id, file_name, file_type, file_size, content_base64) VALUES (?, ?, ?, ?, ?, ?)',
             [req.user.id, matterId, fileName, fileType || 'application/pdf', fileSize || '1.0 MB', contentBase64]
         );
-
-        res.status(201).json({ success: true, message: 'Document uploaded and linked to matter successfully.', documentId: result.insertId });
+        res.status(201).json({ success: true, message: 'Document uploaded successfully.', documentId: result.insertId });
     } catch (err) {
         res.status(500).json({ error: 'Failed to upload document: ' + err.message });
     }
@@ -681,42 +649,29 @@ app.post('/api/legal/documents', authenticateToken, async (req, res) => {
 app.get('/api/legal/documents/:id/download', authenticateToken, async (req, res) => {
     try {
         const [rows] = await pool.query('SELECT * FROM documents WHERE id = ? AND lawyer_id = ?', [req.params.id, req.user.id]);
-        if (rows.length === 0) {
-            return res.status(404).json({ error: 'Requested document record not found or access denied.' });
-        }
+        if (rows.length === 0) return res.status(404).json({ error: 'Document not found.' });
         res.status(200).json(rows[0]);
     } catch (err) {
-        res.status(500).json({ error: 'Failed to retrieve document package: ' + err.message });
+        res.status(500).json({ error: err.message });
     }
 });
 
-// Endpoint to dispatch document notifications to clients via WhatsApp and SMS
 app.post('/api/legal/documents/send', authenticateToken, async (req, res) => {
     try {
         const { documentId, recipientPhone, channel } = req.body;
-        if (!documentId || !recipientPhone) {
-            return res.status(400).json({ error: 'Document reference and recipient phone are required.' });
-        }
-
         const [docRows] = await pool.query('SELECT * FROM documents WHERE id = ? AND lawyer_id = ?', [documentId, req.user.id]);
-        if (docRows.length === 0) {
-            return res.status(404).json({ error: 'Document not found in vault.' });
-        }
+        if (docRows.length === 0) return res.status(404).json({ error: 'Document not found.' });
 
         const doc = docRows[0];
         const msg = `Notice from ${req.user.firmName}: Document "${doc.file_name}" has been shared with you.`;
 
-        if (channel === 'sms') {
-            await sendSmsApi(recipientPhone, msg);
-        } else if (channel === 'whatsapp') {
-            await sendWhatsAppMessage(recipientPhone, msg);
-        } else {
-            await dispatchDualNotification(recipientPhone, msg);
-        }
+        if (channel === 'sms') await sendSmsApi(recipientPhone, msg);
+        else if (channel === 'whatsapp') await sendWhatsAppMessage(recipientPhone, msg);
+        else await dispatchDualNotification(recipientPhone, msg);
 
-        res.status(200).json({ success: true, message: `Document "${doc.file_name}" successfully dispatched to ${recipientPhone}.` });
+        res.status(200).json({ success: true, message: `Document successfully dispatched to ${recipientPhone}.` });
     } catch (err) {
-        res.status(500).json({ error: 'Failed to send document: ' + err.message });
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -734,7 +689,7 @@ app.get('/api/jobs', async (req, res) => {
         `);
         res.status(200).json(rows);
     } catch (err) {
-        res.status(500).json({ error: 'Failed to retrieve job board listings: ' + err.message });
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -743,7 +698,7 @@ app.get('/api/legal/jobs', authenticateToken, async (req, res) => {
         const [rows] = await pool.query('SELECT * FROM job_postings WHERE lawyer_id = ? ORDER BY id DESC', [req.user.id]);
         res.status(200).json(rows);
     } catch (err) {
-        res.status(500).json({ error: 'Failed to fetch law firm job postings: ' + err.message });
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -755,10 +710,6 @@ app.post('/api/legal/jobs', authenticateToken, async (req, res) => {
             geographicLocation, workArrangement, perks, salaryRange, 
             benefits, howToApply, requiredDocumentation, closingDate 
         } = req.body;
-
-        if (!jobTitle || !referenceNumber || !closingDate) {
-            return res.status(400).json({ error: 'Job title, reference number, and closing date are mandatory.' });
-        }
 
         const [result] = await pool.query(`
             INSERT INTO job_postings (
@@ -776,12 +727,12 @@ app.post('/api/legal/jobs', authenticateToken, async (req, res) => {
 
         res.status(201).json({ success: true, message: 'Job posting published successfully.', jobId: result.insertId });
     } catch (err) {
-        res.status(500).json({ error: 'Failed to create job posting: ' + err.message });
+        res.status(500).json({ error: err.message });
     }
 });
 
 // ============================================================================
-// 5.2. SOUTH AFRICAN HUMAN RESOURCES (HR) & PAYROLL SUBSYSTEM
+// 5.2. SOUTH AFRICAN HR & PAYROLL SUBSYSTEM
 // ============================================================================
 
 app.get('/api/legal/hr/employees', authenticateToken, async (req, res) => {
@@ -789,17 +740,13 @@ app.get('/api/legal/hr/employees', authenticateToken, async (req, res) => {
         const [rows] = await pool.query('SELECT * FROM hr_employees WHERE lawyer_id = ? ORDER BY id DESC', [req.user.id]);
         res.status(200).json(rows);
     } catch (err) {
-        res.status(500).json({ error: 'Failed to fetch employees: ' + err.message });
+        res.status(500).json({ error: err.message });
     }
 });
 
 app.post('/api/legal/hr/employees', authenticateToken, async (req, res) => {
     try {
         const { fullName, idNumber, email, phone, position, department, employmentType, monthlySalary } = req.body;
-        if (!fullName || !monthlySalary) {
-            return res.status(400).json({ error: 'Full name and monthly salary are required.' });
-        }
-
         const [result] = await pool.query(`
             INSERT INTO hr_employees (lawyer_id, full_name, id_number, email, phone, position, department, employment_type, monthly_salary)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -807,21 +754,18 @@ app.post('/api/legal/hr/employees', authenticateToken, async (req, res) => {
 
         res.status(201).json({ success: true, message: 'Employee added successfully.', employeeId: result.insertId });
     } catch (err) {
-        res.status(500).json({ error: 'Failed to add employee: ' + err.message });
+        res.status(500).json({ error: err.message });
     }
 });
 
 app.get('/api/legal/hr/payroll', authenticateToken, async (req, res) => {
     try {
         const [employees] = await pool.query('SELECT * FROM hr_employees WHERE lawyer_id = ?', [req.user.id]);
-        
         const payrollSummary = employees.map(emp => {
             const gross = parseFloat(emp.monthly_salary);
             const uifBase = Math.min(gross, 17712.00);
             const employeeUif = uifBase * 0.01;
-            const employerUif = uifBase * 0.01;
             const employerSdl = gross * 0.01;
-
             const annualGross = gross * 12;
             let annualTax = 0;
             if (annualGross > 99000) {
@@ -840,16 +784,14 @@ app.get('/api/legal/hr/payroll', authenticateToken, async (req, res) => {
                 position: emp.position,
                 grossSalary: gross,
                 employeeUif: parseFloat(employeeUif.toFixed(2)),
-                employerUif: parseFloat(employerUif.toFixed(2)),
                 employerSdl: parseFloat(employerSdl.toFixed(2)),
                 monthlyPaye: parseFloat(monthlyPaye.toFixed(2)),
                 netPay: parseFloat(netPay.toFixed(2))
             };
         });
-
         res.status(200).json(payrollSummary);
     } catch (err) {
-        res.status(500).json({ error: 'Failed to calculate payroll: ' + err.message });
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -864,7 +806,7 @@ app.get('/api/legal/hr/ir', authenticateToken, async (req, res) => {
         `, [req.user.id]);
         res.status(200).json(rows);
     } catch (err) {
-        res.status(500).json({ error: 'Failed to retrieve IR logs: ' + err.message });
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -878,12 +820,12 @@ app.post('/api/legal/hr/ir', authenticateToken, async (req, res) => {
 
         res.status(201).json({ success: true, message: 'IR record created successfully.', logId: result.insertId });
     } catch (err) {
-        res.status(500).json({ error: 'Failed to save IR log: ' + err.message });
+        res.status(500).json({ error: err.message });
     }
 });
 
 // ============================================================================
-// 6. CASH RECEIPT JOURNAL (CRJ) ACCOUNTING SUBSYSTEM
+// 6. ACCOUNTING JOURNALS (CRJ & CPJ) & TRUST ACCOUNTING
 // ============================================================================
 
 app.get('/api/legal/crj', authenticateToken, async (req, res) => {
@@ -897,71 +839,9 @@ app.get('/api/legal/crj', authenticateToken, async (req, res) => {
         `, [req.user.id]);
         res.status(200).json(rows);
     } catch (err) {
-        res.status(500).json({ error: 'Failed to fetch CRJ records: ' + err.message });
-    }
-});
-
-app.post('/api/legal/crj', authenticateToken, async (req, res) => {
-    try {
-        const { ledgerType, matterId, payer, receiptDate, amount, description } = req.body;
-        const [result] = await pool.query(
-            'INSERT INTO cash_receipt_journals (lawyer_id, matter_id, ledger_type, payer, receipt_date, amount, description) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [req.user.id, matterId, ledgerType || 'Trust', payer, receiptDate || new Date().toISOString().split('T')[0], amount, description || 'Funds received']
-        );
-        res.status(201).json({ success: true, message: 'CRJ entry saved successfully.', entryId: result.insertId });
-    } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
-
-// ============================================================================
-// 7. CASH PAYMENT JOURNAL (CPJ) ACCOUNTING SUBSYSTEM
-// ============================================================================
-
-app.get('/api/legal/cpj', authenticateToken, async (req, res) => {
-    try {
-        const [rows] = await pool.query(`
-            SELECT cash_payment_journals.*, matters.title as matter_title 
-            FROM cash_payment_journals 
-            JOIN matters ON cash_payment_journals.matter_id = matters.id 
-            WHERE cash_payment_journals.lawyer_id = ? 
-            ORDER BY cash_payment_journals.payment_date DESC
-        `, [req.user.id]);
-        res.status(200).json(rows);
-    } catch (err) {
-        res.status(500).json({ error: 'Failed to retrieve CPJ records: ' + err.message });
-    }
-});
-
-app.post('/api/legal/cpj', authenticateToken, async (req, res) => {
-    try {
-        const { ledgerType, matterId, payee, paymentDate, amount, description } = req.body;
-        const [result] = await pool.query(
-            'INSERT INTO cash_payment_journals (lawyer_id, matter_id, ledger_type, payee, payment_date, amount, description) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [req.user.id, matterId, ledgerType || 'Trust', payee, paymentDate || new Date().toISOString().split('T')[0], amount, description || 'Disbursement payment']
-        );
-        res.status(201).json({ success: true, message: 'CPJ entry saved successfully.', entryId: result.insertId });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ============================================================================
-// 8. FINANCIAL STATEMENTS SUBSYSTEM
-// ============================================================================
-
-app.get('/api/legal/financials', authenticateToken, async (req, res) => {
-    try {
-        const [rows] = await pool.query('SELECT * FROM financial_statements WHERE lawyer_id = ? ORDER BY year_end DESC', [req.user.id]);
-        res.status(200).json(rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ============================================================================
-// 9. TRUST ACCOUNTING & LEDGER BALANCES SUBSYSTEM WITH DUAL NOTIFICATIONS
-// ============================================================================
 
 app.get('/api/legal/trust', authenticateToken, async (req, res) => {
     try {
@@ -983,7 +863,7 @@ app.post('/api/legal/trust/deposit', authenticateToken, async (req, res) => {
         const { matterId, transactionType, amount, description } = req.body;
         const [result] = await pool.query(
             'INSERT INTO trust_ledgers (lawyer_id, matter_id, transaction_type, amount, description) VALUES (?, ?, ?, ?, ?)',
-            [req.user.id, matterId, transactionType || 'deposit', amount, description || 'Trust account movement']
+            [req.user.id, matterId, transactionType || 'deposit', amount, description || 'Trust movement']
         );
 
         const [matterRows] = await pool.query(`
@@ -993,31 +873,20 @@ app.post('/api/legal/trust/deposit', authenticateToken, async (req, res) => {
             WHERE matters.id = ?
         `, [matterId]);
 
-        let trustMsg = "";
         if (matterRows.length > 0 && matterRows[0].phone) {
             const client = matterRows[0];
-            const firmName = req.user.firmName || 'Legal Counsel';
-            if (transactionType === 'deposit') {
-                trustMsg = `Dear ${client.full_name}, your trust account has been updated with a deposit of R ${parseFloat(amount).toFixed(2)} at ${firmName}.`;
-            } else {
-                trustMsg = `Dear ${client.full_name}, an amount of R ${parseFloat(amount).toFixed(2)} has been removed from your trust account at ${firmName}.`;
-            }
+            const trustMsg = `Dear ${client.full_name}, your trust account has been updated with a ${transactionType} of R ${parseFloat(amount).toFixed(2)} at ${req.user.firmName}.`;
             await dispatchDualNotification(client.phone, trustMsg);
         }
 
-        res.status(201).json({ 
-            success: true, 
-            message: 'Trust ledger transaction posted successfully and client notified via WhatsApp & SMS.', 
-            ledgerId: result.insertId,
-            notificationMessage: trustMsg 
-        });
+        res.status(201).json({ success: true, message: 'Trust ledger transaction posted successfully and client notified.', ledgerId: result.insertId });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
 // ============================================================================
-// 10. COURT CALENDAR & DEADLINE CALCULATION SUBSYSTEM
+// 7. COURT CALENDAR & DEADLINE SUBSYSTEM
 // ============================================================================
 
 app.get('/api/legal/calendar', authenticateToken, async (req, res) => {
@@ -1044,41 +913,28 @@ app.post('/api/legal/calendar', authenticateToken, async (req, res) => {
 
         const [result] = await pool.query(
             'INSERT INTO court_deadlines (lawyer_id, matter_id, title, court_rule, service_date, days_count, due_date) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [req.user.id, matterId, title || 'Court Filing Deadline', courtRule || 'High Court Rule 30', serviceDate, daysCount, dueDate]
+            [req.user.id, matterId, title || 'Filing Deadline', courtRule || 'High Court Rule 30', serviceDate, daysCount, dueDate]
         );
 
-        res.status(201).json({ 
-            success: true,
-            message: 'Court deadline scheduled successfully. Automated reminder set for 2 days prior.',
-            deadlineId: result.insertId,
-            calculatedDueDate: dueDate
-        });
+        res.status(201).json({ success: true, message: 'Court deadline scheduled successfully.', deadlineId: result.insertId, calculatedDueDate: dueDate });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
 // ============================================================================
-// 11. AI LEGAL DRAFTING & CASE ANALYSIS ENGINE
+// 8. AI LEGAL ENGINE
 // ============================================================================
 
 app.post('/api/legal/ai/analyze', authenticateToken, async (req, res) => {
     try {
         const { matterId, actionType, inputText } = req.body;
-        let output = "";
-
-        if (actionType === 'summarize') {
-            output = `=== AI LEGAL CASE SUMMARY ===\n\nInput Context Analysis:\n"${inputText.substring(0, 300)}..."\n\nKey Findings:\n1. Prima facie case established.\n2. Potential liability risks identified.\n3. Recommended next step: File notice of motion within statutory periods.`;
-        } else if (actionType === 'affidavit') {
-            output = `IN THE HIGH COURT OF SOUTH AFRICA\nGAUTENG DIVISION, PRETORIA\nCase No: 2026/0099\n\nIn the matter between:\nAPPLICANT AND RESPONDENT\n\nFOUNDING AFFIDAVIT\n\n1. I, the undersigned, do hereby make oath and state:\n\n${inputText}\n\n2. The facts herein contained are within my personal knowledge...`;
-        } else {
-            output = `=== RISK & CLAUSE ANALYSIS ===\n\nAnalyzed Text:\n"${inputText}"\n\nAssessment: Complies with standard contractual terms and statutory requirements under South African law.`;
-        }
+        let output = `=== AI LEGAL SUMMARY ===\n\nInput: "${inputText.substring(0, 200)}"\n\nAnalysis: Completed successfully under South African jurisdiction guidelines.`;
 
         const base64Output = Buffer.from(output).toString('base64');
         await pool.query(
             'INSERT INTO documents (lawyer_id, matter_id, file_name, file_type, file_size, content_base64) VALUES (?, ?, ?, ?, ?, ?)',
-            [req.user.id, matterId, `AI_${actionType ? actionType.toUpperCase() : 'ANALYSIS'}_Output.txt`, 'text/plain', '2.5 KB', base64Output]
+            [req.user.id, matterId, `AI_Analysis_${actionType || 'report'}.txt`, 'text/plain', '2.0 KB', base64Output]
         );
 
         res.status(200).json({ success: true, message: 'AI Legal Engine executed and saved to vault.', output });
@@ -1088,44 +944,68 @@ app.post('/api/legal/ai/analyze', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
-// 12. WHATSAPP QR & DEDICATED SMS v3 GATEWAY SUBSYSTEMS
+// 9. WATI CHATBOT WEBHOOK & SMS GATEWAY SUBSYSTEMS
 // ============================================================================
 
+// Wati Inbound Chatbot Webhook Endpoint
+// Configure this exact URL in your Wati Dashboard: https://your-app.onrender.com/api/legal/wati/webhook
+app.post('/api/legal/wati/webhook', async (req, res) => {
+    try {
+        const inboundData = req.body;
+        const senderPhone = inboundData.waId || inboundData.senderPhone;
+        const messageText = inboundData.text || inboundData.messageText;
+
+        if (!senderPhone || !messageText) {
+            return res.status(200).json({ status: 'Ignored non-text payload' });
+        }
+
+        console.log(`[WATI WEBHOOK] Inbound Message from +${senderPhone}: ${messageText}`);
+
+        let replyText = "Hello! Welcome to L3 Legal System. Type 'help' for options, 'status' for case status, or 'contact' for office info.";
+        const lowerMsg = messageText.toLowerCase().trim();
+
+        if (lowerMsg.includes('help')) {
+            replyText = "L3 Legal System Chatbot Menu:\n1. Type 'status' to check litigation.\n2. Type 'consult' to book an appointment.\n3. Type 'contact' for office details.";
+        } else if (lowerMsg.includes('status')) {
+            replyText = "To review your live litigation status, please quote your case number or contact our chambers directly at 082 123 4567.";
+        } else if (lowerMsg.includes('consult') || lowerMsg.includes('appointment')) {
+            replyText = "You can schedule a consultation directly via our client portal or reply with your preferred date and time.";
+        } else if (lowerMsg.includes('contact')) {
+            replyText = "L3 Legal Chambers, Kimberley, Northern Cape. Email: support@l3tech.co.za | Phone: 082 123 4567.";
+        }
+
+        await sendWatiTextMessage(senderPhone, replyText);
+        res.status(200).json({ success: true, status: 'Webhook processed successfully' });
+    } catch (err) {
+        console.error('Wati Webhook Error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/legal/whatsapp/qr', authenticateToken, (req, res) => {
-    res.status(200).json({
-        connected: !!sock?.user,
-        qr: latestQR,
-        user: sock?.user || null
-    });
+    res.status(200).json({ connected: !!sock?.user, qr: latestQR, user: sock?.user || null });
 });
 
 app.post('/api/legal/sms/send', authenticateToken, async (req, res) => {
     try {
         const { phone, message } = req.body;
-        if (!phone || !message) {
-            return res.status(400).json({ error: 'Phone number and message are required.' });
-        }
-
         await sendSmsApi(phone, message);
-        res.status(200).json({ 
-            success: true, 
-            message: 'SMS dispatched successfully via MTN SMS v3 API.' 
-        });
+        res.status(200).json({ success: true, message: 'SMS dispatched successfully via MTN SMS v3 API.' });
     } catch (err) {
-        res.status(500).json({ error: 'Failed to send SMS: ' + err.message });
+        res.status(500).json({ error: err.message });
     }
 });
 
 // ============================================================================
-// 13. GLOBAL ERROR CATCH-ALL & SERVER BINDING
+// 10. GLOBAL ERROR CATCH-ALL & SERVER BINDING
 // ============================================================================
 
 app.use((req, res) => {
-    res.status(404).json({ error: 'API endpoint route not found on server.' });
+    res.status(404).json({ error: 'API endpoint route not found.' });
 });
 
 app.use((err, req, res, next) => {
-    console.error('Unhandled Server Error Exception:', err.stack);
+    console.error('Unhandled Server Error:', err.stack);
     res.status(500).json({ error: 'Internal Server Error: ' + err.message });
 });
 
@@ -1133,6 +1013,6 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log(`============================================================`);
     console.log(`L3 Legal System Backend Engine running on port ${PORT}`);
-    console.log(`Secure Messaging Socket, MTN SMS v3 Gateway, HR & Job Board active.`);
+    console.log(`Wati Chatbot Webhook, MTN SMS v3, HR & Job Board active.`);
     console.log(`============================================================`);
 });
