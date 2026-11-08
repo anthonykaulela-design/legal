@@ -267,12 +267,16 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
     const credentials = Buffer.from(`${SMS_API_KEY}:${SMS_API_SECRET}`).toString('base64');
     const transactionId = crypto.randomUUID();
     
-    // Step 1: Exchange credentials for Bearer Token per spec (POST /oauth/access_token)[cite: 108, 109]
-    const tokenRes = await axios.post(tokenUrl, 'grant_type=client_credentials', {
+    // Explicitly serialize body using URLSearchParams for x-www-form-urlencoded
+    const tokenParams = new URLSearchParams();
+    tokenParams.append('grant_type', 'client_credentials');
+
+    const tokenRes = await axios.post(tokenUrl, tokenParams, {
         headers: {
             'Authorization': `Basic ${credentials}`,
             'Content-Type': 'application/x-www-form-urlencoded',
-            'transactionId': transactionId
+            'transactionId': transactionId,
+            'Ocp-Apim-Subscription-Key': SMS_API_KEY
         },
         timeout: 10000
     });
@@ -284,35 +288,25 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
 
     console.log(`[MTN SMS v3] OAuth token acquired successfully. Dispatching outbound SMS to +${formattedPhone}`);
 
-    // Step 2: Construct strict payload matching MTN SMS v3 schema[cite: 111, 112, 113]
     const mtnPayload = {
-        senderAddress: customSenderAddress || 'L3Legal',
-        cpAddress: 'L3_Chambers',
-        receiverAddress: [formattedPhone], // Must be array of strings per spec[cite: 112]
+        senderAddress: process.env.MTN_SENDER_ADDRESS || customSenderAddress || 'L3Legal',
+        receiverAddress: [formattedPhone],
         message: message,
         clientCorrelator: 'l3_corr_' + Date.now()
     };
 
-    // Step 3: POST to outbound SMS endpoint per spec[cite: 108, 110]
     const outboundRes = await axios.post(`${baseUrl}/messages/sms/outbound`, mtnPayload, {
         headers: { 
             'Authorization': `Bearer ${accessToken}`, 
             'Content-Type': 'application/json',
-            'transactionId': crypto.randomUUID()
+            'transactionId': crypto.randomUUID(),
+            'Ocp-Apim-Subscription-Key': SMS_API_KEY
         },
         timeout: 15000
     });
     
     console.log('[MTN SMS v3] Outbound SMS successfully accepted by gateway:', outboundRes.data);
     return outboundRes.data;
-}
-
-async function dispatchDualNotification(phone, message) {
-    if (!phone) return;
-    await Promise.allSettled([
-        sendWhatsAppMessage(phone, message),
-        sendSmsApi(phone, message)
-    ]);
 }
 
 // --- AUTOMATED BACKGROUND CRON SCHEDULER (Every 10 minutes) ---
