@@ -261,7 +261,7 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
     }
     
     const baseUrl = process.env.MTN_BASE_URL || 'https://api.mtn.com/v1';
-    const tokenUrl = `${baseUrl}/oauth/access_token`;[cite: 109]
+    const tokenUrl = `${baseUrl}/oauth/access_token`;
 
     console.log(`[MTN SMS v3] Requesting OAuth access token from ${tokenUrl}...`);
     const credentials = Buffer.from(`${SMS_API_KEY}:${SMS_API_SECRET}`).toString('base64');
@@ -384,7 +384,7 @@ app.get('/', (req, res) => {
         baileysSocket: sock?.user ? 'connected' : 'initializing',
         watiChatbotWebhook: 'active',
         smsGateway: 'active (MTN SMS v3 Spec - Strict Live)',
-        version: '5.9.2-production',
+        version: '5.9.3-production',
         timestamp: new Date().toISOString()
     });
 });
