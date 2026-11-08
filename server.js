@@ -3,7 +3,7 @@
  * L3 LEGAL PRACTICE MANAGEMENT & ENTERPRISE POS SUITE
  * Enterprise Full-Stack Backend Server (Node.js & Express)
  * Target Deployment: Render Cloud Hosting & TiDB Cloud Serverless (MySQL)
- * Complete with Baileys Outbound Messaging, MTN SMS v1 API Gateway, Wati Webhook
+ * Complete with Baileys Outbound Messaging, MTN SMS v3 API Gateway, Wati Webhook
  * ============================================================================
  */
 
@@ -253,7 +253,7 @@ async function sendWhatsAppMessage(phone, message) {
     return false;
 }
 
-// --- MTN SMS v1 GATEWAY (Updated with URLSearchParams & Subscription Header) ---
+// --- STRICT MTN SMS v3 SPECIFICATION GATEWAY (NO SIMULATION) ---
 async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
     let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
     if (formattedPhone.startsWith('0')) {
@@ -261,57 +261,50 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
     }
     
     const baseUrl = process.env.MTN_BASE_URL || 'https://api.mtn.com/v1';
-    const tokenUrl = `${baseUrl}/oauth/access_token`;
+    const tokenUrl = `${baseUrl}/oauth/access_token`;[cite: 109]
 
-    try {
-        console.log(`[MTN SMS v1] Requesting OAuth access token from ${tokenUrl}...`);
-        const credentials = Buffer.from(`${SMS_API_KEY}:${SMS_API_SECRET}`).toString('base64');
-        const transactionId = crypto.randomUUID();
-        
-        // Correctly format body as application/x-www-form-urlencoded using URLSearchParams
-        const params = new URLSearchParams();
-        params.append('grant_type', 'client_credentials');
-
-        const tokenRes = await axios.post(tokenUrl, params, {
-            headers: {
-                'Authorization': `Basic ${credentials}`,
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'transactionId': transactionId,
-                'Ocp-Apim-Subscription-Key': SMS_API_KEY
-            },
-            timeout: 5000
-        });
-        
-        const accessToken = tokenRes.data.access_token || tokenRes.data.accessToken;
-        console.log(`[MTN SMS v1] OAuth token acquired successfully. Dispatching outbound SMS to +${formattedPhone}`);
-
-        const mtnPayload = {
-            senderAddress: customSenderAddress || 'L3Legal',
-            cpAddress: 'L3_Chambers',
-            receiverAddress: [formattedPhone],
-            message: message,
-            clientCorrelator: 'l3_corr_' + Date.now()
-        };
-
-        const outboundRes = await axios.post(`${baseUrl}/messages/sms/outbound`, mtnPayload, {
-            headers: { 
-                'Authorization': `Bearer ${accessToken}`, 
-                'Content-Type': 'application/json',
-                'transactionId': transactionId,
-                'Ocp-Apim-Subscription-Key': SMS_API_KEY
-            },
-            timeout: 10000
-        });
-        
-        console.log('[MTN SMS v1] Outbound SMS successfully accepted by gateway:', outboundRes.data);
-        return true;
-    } catch (smsErr) {
-        const reqUrl = smsErr.config?.url || 'unknown URL';
-        const statusCode = smsErr.response?.status || 'no status';
-        const errorDetails = smsErr.response?.data ? JSON.stringify(smsErr.response.data) : smsErr.message;
-        console.warn(`[MTN SMS v1] Gateway error at [${reqUrl}] (Status ${statusCode}: ${errorDetails}). Handled gracefully with simulated success fallback.`);
-        return true;
+    console.log(`[MTN SMS v3] Requesting OAuth access token from ${tokenUrl}...`);
+    const credentials = Buffer.from(`${SMS_API_KEY}:${SMS_API_SECRET}`).toString('base64');
+    const transactionId = crypto.randomUUID();
+    
+    // Step 1: Exchange credentials for Bearer Token per spec (POST /oauth/access_token)[cite: 108, 109]
+    const tokenRes = await axios.post(tokenUrl, 'grant_type=client_credentials', {
+        headers: {
+            'Authorization': `Basic ${credentials}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'transactionId': transactionId
+        },
+        timeout: 10000
+    });
+    
+    const accessToken = tokenRes.data.access_token || tokenRes.data.accessToken;
+    if (!accessToken) {
+        throw new Error('Failed to retrieve access token from MTN OAuth response.');
     }
+
+    console.log(`[MTN SMS v3] OAuth token acquired successfully. Dispatching outbound SMS to +${formattedPhone}`);
+
+    // Step 2: Construct strict payload matching MTN SMS v3 schema[cite: 111, 112, 113]
+    const mtnPayload = {
+        senderAddress: customSenderAddress || 'L3Legal',
+        cpAddress: 'L3_Chambers',
+        receiverAddress: [formattedPhone], // Must be array of strings per spec[cite: 112]
+        message: message,
+        clientCorrelator: 'l3_corr_' + Date.now()
+    };
+
+    // Step 3: POST to outbound SMS endpoint per spec[cite: 108, 110]
+    const outboundRes = await axios.post(`${baseUrl}/messages/sms/outbound`, mtnPayload, {
+        headers: { 
+            'Authorization': `Bearer ${accessToken}`, 
+            'Content-Type': 'application/json',
+            'transactionId': crypto.randomUUID()
+        },
+        timeout: 15000
+    });
+    
+    console.log('[MTN SMS v3] Outbound SMS successfully accepted by gateway:', outboundRes.data);
+    return outboundRes.data;
 }
 
 async function dispatchDualNotification(phone, message) {
@@ -390,8 +383,8 @@ app.get('/', (req, res) => {
         system: 'L3 Legal Practice Management Suite & Enterprise POS',
         baileysSocket: sock?.user ? 'connected' : 'initializing',
         watiChatbotWebhook: 'active',
-        smsGateway: 'active (MTN SMS v1 Spec)',
-        version: '5.8.1-production',
+        smsGateway: 'active (MTN SMS v3 Spec - Strict Live)',
+        version: '5.9.2-production',
         timestamp: new Date().toISOString()
     });
 });
@@ -1023,10 +1016,20 @@ app.get('/api/legal/whatsapp/qr', authenticateToken, (req, res) => {
 app.post('/api/legal/sms/send', authenticateToken, async (req, res) => {
     try {
         const { phone, message, senderAddress } = req.body;
-        await sendSmsApi(phone, message, senderAddress);
-        res.status(200).json({ success: true, message: 'SMS dispatched successfully via MTN SMS v1 API.' });
+        const mtnResponse = await sendSmsApi(phone, message, senderAddress);
+        res.status(200).json({ 
+            success: true, 
+            message: 'SMS successfully dispatched via MTN SMS v3 API.', 
+            mtnGatewayResponse: mtnResponse 
+        });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        const statusCode = err.response?.status || 500;
+        const errorDetail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+        console.error('[MTN SMS API Error Route]:', errorDetail);
+        res.status(statusCode).json({ 
+            success: false, 
+            error: `MTN SMS Gateway Error: ${errorDetail}` 
+        });
     }
 });
 
@@ -1047,6 +1050,6 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log(`============================================================`);
     console.log(`L3 Legal System Backend Engine running on port ${PORT}`);
-    console.log(`Baileys Client Messaging, Wati Webhook, MTN SMS v1 API active.`);
+    console.log(`Baileys Client Messaging, Wati Webhook, MTN SMS v3 Strict Live.`);
     console.log(`============================================================`);
 });
