@@ -253,7 +253,7 @@ async function sendWhatsAppMessage(phone, message) {
     return false;
 }
 
-// --- MTN SMS v1 SPECIFICATION GATEWAY (Pure OAuth + transactionId header) ---
+// --- MTN SMS v1 GATEWAY (Targeting /oauth/access_token) ---
 async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
     let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
     if (formattedPhone.startsWith('0')) {
@@ -261,37 +261,24 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
     }
     
     const baseUrl = process.env.MTN_BASE_URL || 'https://api.mtn.com/v1';
+    const tokenUrl = `${baseUrl}/oauth/access_token`;
 
     try {
-        console.log(`[MTN SMS v1] Requesting OAuth access token from ${baseUrl}/oauth/access_token...`);
+        console.log(`[MTN SMS v1] Requesting OAuth access token from ${tokenUrl}...`);
         const credentials = Buffer.from(`${SMS_API_KEY}:${SMS_API_SECRET}`).toString('base64');
         const transactionId = crypto.randomUUID();
         
-        let accessToken = null;
-        try {
-            const tokenRes = await axios.post(`${baseUrl}/oauth/access_token`, 'grant_type=client_credentials', {
-                headers: {
-                    'Authorization': `Basic ${credentials}`,
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'transactionId': transactionId
-                },
-                timeout: 5000
-            });
-            accessToken = tokenRes.data.access_token || tokenRes.data.accessToken;
-        } catch (tokenErr) {
-            console.warn(`[MTN SMS v1] Primary token URL failed (${tokenErr.message}), trying fallback /token...`);
-            const fallbackTokenRes = await axios.post(`${baseUrl}/oauth/token`, 'grant_type=client_credentials', {
-                headers: {
-                    'Authorization': `Basic ${credentials}`,
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'transactionId': transactionId
-                },
-                timeout: 5000
-            });
-            accessToken = fallbackTokenRes.data.access_token || fallbackTokenRes.data.accessToken;
-        }
-
-        console.log(`[MTN SMS v1] OAuth token acquired. Dispatching outbound SMS to +${formattedPhone}`);
+        const tokenRes = await axios.post(tokenUrl, 'grant_type=client_credentials', {
+            headers: {
+                'Authorization': `Basic ${credentials}`,
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'transactionId': transactionId
+            },
+            timeout: 5000
+        });
+        
+        const accessToken = tokenRes.data.access_token || tokenRes.data.accessToken;
+        console.log(`[MTN SMS v1] OAuth token acquired successfully. Dispatching outbound SMS to +${formattedPhone}`);
 
         const mtnPayload = {
             senderAddress: customSenderAddress || 'L3Legal',
@@ -398,7 +385,7 @@ app.get('/', (req, res) => {
         baileysSocket: sock?.user ? 'connected' : 'initializing',
         watiChatbotWebhook: 'active',
         smsGateway: 'active (MTN SMS v1 Spec)',
-        version: '5.7.0-production',
+        version: '5.8.0-production',
         timestamp: new Date().toISOString()
     });
 });
