@@ -253,7 +253,7 @@ async function sendWhatsAppMessage(phone, message) {
     return false;
 }
 
-// --- MTN SMS v1 GATEWAY (Targeting /oauth/access_token) ---
+// --- MTN SMS v1 GATEWAY (Updated with URLSearchParams & Subscription Header) ---
 async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
     let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
     if (formattedPhone.startsWith('0')) {
@@ -268,11 +268,16 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
         const credentials = Buffer.from(`${SMS_API_KEY}:${SMS_API_SECRET}`).toString('base64');
         const transactionId = crypto.randomUUID();
         
-        const tokenRes = await axios.post(tokenUrl, 'grant_type=client_credentials', {
+        // Correctly format body as application/x-www-form-urlencoded using URLSearchParams
+        const params = new URLSearchParams();
+        params.append('grant_type', 'client_credentials');
+
+        const tokenRes = await axios.post(tokenUrl, params, {
             headers: {
                 'Authorization': `Basic ${credentials}`,
                 'Content-Type': 'application/x-www-form-urlencoded',
-                'transactionId': transactionId
+                'transactionId': transactionId,
+                'Ocp-Apim-Subscription-Key': SMS_API_KEY
             },
             timeout: 5000
         });
@@ -292,7 +297,8 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
             headers: { 
                 'Authorization': `Bearer ${accessToken}`, 
                 'Content-Type': 'application/json',
-                'transactionId': transactionId
+                'transactionId': transactionId,
+                'Ocp-Apim-Subscription-Key': SMS_API_KEY
             },
             timeout: 10000
         });
@@ -385,7 +391,7 @@ app.get('/', (req, res) => {
         baileysSocket: sock?.user ? 'connected' : 'initializing',
         watiChatbotWebhook: 'active',
         smsGateway: 'active (MTN SMS v1 Spec)',
-        version: '5.8.0-production',
+        version: '5.8.1-production',
         timestamp: new Date().toISOString()
     });
 });
