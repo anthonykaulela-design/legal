@@ -260,12 +260,12 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
         formattedPhone = '27' + formattedPhone.substring(1);
     }
     
-    const baseUrl = process.env.MTN_BASE_URL || 'https://api.mtn.com/v1';[cite: 11]
+    const baseUrl = process.env.MTN_BASE_URL || 'https://api.mtn.com/v1';
 
     try {
-        console.log(`[MTN SMS v1] Requesting OAuth access token from ${baseUrl}/oauth/access_token...`);[cite: 11, 12]
+        console.log(`[MTN SMS v1] Requesting OAuth access token from ${baseUrl}/oauth/access_token...`);
         const credentials = Buffer.from(`${SMS_API_KEY}:${SMS_API_SECRET}`).toString('base64');
-        const transactionId = crypto.randomUUID();[cite: 13, 24]
+        const transactionId = crypto.randomUUID();
         
         let accessToken = null;
         try {
@@ -293,20 +293,19 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
 
         console.log(`[MTN SMS v1] OAuth token acquired. Dispatching outbound SMS to +${formattedPhone}`);
 
-        // Payload adhering strictly to MTN SMS v1 specification
         const mtnPayload = {
-            senderAddress: customSenderAddress || 'L3Legal',[cite: 14]
-            cpAddress: 'L3_Chambers',[cite: 15]
-            receiverAddress: [formattedPhone],[cite: 15]
-            message: message,[cite: 15]
-            clientCorrelator: 'l3_corr_' + Date.now()[cite: 16]
+            senderAddress: customSenderAddress || 'L3Legal',
+            cpAddress: 'L3_Chambers',
+            receiverAddress: [formattedPhone],
+            message: message,
+            clientCorrelator: 'l3_corr_' + Date.now()
         };
 
-        const outboundRes = await axios.post(`${baseUrl}/messages/sms/outbound`, mtnPayload, {[cite: 11]
+        const outboundRes = await axios.post(`${baseUrl}/messages/sms/outbound`, mtnPayload, {
             headers: { 
-                'Authorization': `Bearer ${accessToken}`,[cite: 11]
-                'Content-Type': 'application/json',[cite: 13]
-                'transactionId': transactionId[cite: 13]
+                'Authorization': `Bearer ${accessToken}`, 
+                'Content-Type': 'application/json',
+                'transactionId': transactionId
             },
             timeout: 10000
         });
