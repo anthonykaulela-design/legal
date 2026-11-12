@@ -25,11 +25,11 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(cors());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'rsa_legal_practice_management_jwt_secret_key_2026';
-const SMS_API_KEY = process.env.SMS_API_KEY || 'OMvq5cRASIB8MvjvtAyRLWc3NAfXPpA4';
-const SMS_API_SECRET = process.env.SMS_API_SECRET || 'ToBrwfnGNkXihClz';
+const SMS_API_KEY = process.env.SMS_API_KEY || 'JY34UmRwc3zyz1fba4XDKOLJGoiUaHTp';
+const SMS_API_SECRET = process.env.SMS_API_SECRET || '1w5OYKGoCAFTg3lK';
 
 // Wati Configuration for Inbound Chatbot Webhook
-const WATI_BASE_URL = process.env.WATI_BASE_URL || 'https://live-mt-server.wati.io/api/ext/v3';
+const WATI_BASE_URL = process.env.WATI_BASE_URL || 'https://wati.io';
 const WATI_API_KEY = process.env.WATI_API_KEY || 'wati_6e5fbaa1-dcf7-4cbb-a32e-258dd3846187.fGeOwsHeqgiy8g66i0LTJkHn--7ws722hRPBgOkZumDSJrWMIGPHy45UGKlwJ22G6Dtca1LY8dHyewJZHpGlzg850F6xuSueacPwH10GZpzqfx19oAAXOxUQTiPbt584';
 
 /**
@@ -253,60 +253,113 @@ async function sendWhatsAppMessage(phone, message) {
     return false;
 }
 
-// --- STRICT MTN SMS v3 SPECIFICATION GATEWAY (NO SIMULATION) ---
+// --- MTN MADAPI SMS GATEWAY (FIXES 404 ROUTING & AUTH) ---
+async function getMtnAccessToken(baseHost) {
+    const credentials = Buffer.from(`${SMS_API_KEY}:${SMS_API_SECRET}`).toString('base64');
+    const tokenParams = new URLSearchParams();
+    tokenParams.append('grant_type', 'client_credentials');
+    tokenParams.append('client_id', SMS_API_KEY);
+    tokenParams.append('client_secret', SMS_API_SECRET);
+    
+    const tokenEndpoints = [
+        `${baseHost}/oauth/client_credential/accesstoken?grant_type=client_credentials`,
+        `${baseHost}/v1/oauth/access_token`
+    ];
+    
+    let lastErr;
+    for (const url of tokenEndpoints) {
+        try {
+            console.log(`[MTN SMS] Requesting OAuth token from ${url}...`);
+            const res = await axios.post(url, tokenParams.toString(), {
+                headers: {
+                    'Authorization': `Basic ${credentials}`,
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Ocp-Apim-Subscription-Key': SMS_API_KEY
+                },
+                timeout: 10000
+            });
+            const token = res.data.access_token || res.data.accessToken;
+            if (token) return token;
+        } catch (err) {
+            lastErr = err;
+            if (err.response?.status !== 404) throw err;
+        }
+    }
+    throw lastErr || new Error('Unable to acquire MTN OAuth token (404 on token endpoints).');
+}
+
 async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
     let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
     if (formattedPhone.startsWith('0')) {
         formattedPhone = '27' + formattedPhone.substring(1);
     }
-    
-    const baseUrl = process.env.MTN_BASE_URL || 'https://api.mtn.com/v1';
-    const tokenUrl = `${baseUrl}/oauth/access_token`;
-
-    console.log(`[MTN SMS v3] Requesting OAuth access token from ${tokenUrl}...`);
-    const credentials = Buffer.from(`${SMS_API_KEY}:${SMS_API_SECRET}`).toString('base64');
-    const transactionId = crypto.randomUUID();
-    
-    // Explicitly serialize body using URLSearchParams for x-www-form-urlencoded
-    const tokenParams = new URLSearchParams();
-    tokenParams.append('grant_type', 'client_credentials');
-
-    const tokenRes = await axios.post(tokenUrl, tokenParams, {
-        headers: {
-            'Authorization': `Basic ${credentials}`,
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'transactionId': transactionId,
-            'Ocp-Apim-Subscription-Key': SMS_API_KEY
-        },
-        timeout: 10000
-    });
-    
-    const accessToken = tokenRes.data.access_token || tokenRes.data.accessToken;
-    if (!accessToken) {
-        throw new Error('Failed to retrieve access token from MTN OAuth response.');
+    if (!formattedPhone) {
+        throw new Error('Valid recipient phone number is required.');
     }
-
-    console.log(`[MTN SMS v3] OAuth token acquired successfully. Dispatching outbound SMS to +${formattedPhone}`);
-
+    
+    const rawBase = process.env.MTN_BASE_URL || 'api.mtn.com';
+    const baseHost = rawBase.replace(/\/v\d+\/?$/, '');
+    const accessToken = await getMtnAccessToken(baseHost);
+    console.log(`[MTN SMS] OAuth token acquired. Dispatching outbound SMS to +${formattedPhone}`);
+    
+    const sender = process.env.MTN_SENDER_ADDRESS || customSenderAddress || 'L3Legal';
     const mtnPayload = {
-        senderAddress: process.env.MTN_SENDER_ADDRESS || customSenderAddress || 'L3Legal',
+        senderAddress: sender,
+        cpAddress: 'L3_Chambers',
         receiverAddress: [formattedPhone],
         message: message,
         clientCorrelator: 'l3_corr_' + Date.now()
     };
-
-    const outboundRes = await axios.post(`${baseUrl}/messages/sms/outbound`, mtnPayload, {
-        headers: { 
-            'Authorization': `Bearer ${accessToken}`, 
-            'Content-Type': 'application/json',
-            'transactionId': crypto.randomUUID(),
-            'Ocp-Apim-Subscription-Key': SMS_API_KEY
-        },
-        timeout: 15000
-    });
     
-    console.log('[MTN SMS v3] Outbound SMS successfully accepted by gateway:', outboundRes.data);
-    return outboundRes.data;
+    const headers = {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'Ocp-Apim-Subscription-Key': SMS_API_KEY,
+        'transactionId': crypto.randomUUID(),
+        'x-country-code': process.env.MTN_COUNTRY_CODE || 'ZAF'
+    };
+
+    const smsEndpoints = [
+        `${baseHost}/v3/messages/sms/outbound`,
+        `${baseHost}/v2/messages/sms/outbound`,
+        `${baseHost}/v1/messages/sms/outbound`
+    ];
+
+    let lastError;
+    for (const endpoint of smsEndpoints) {
+        try {
+            console.log(`[MTN SMS] Attempting dispatch via ${endpoint}...`);
+            const outboundRes = await axios.post(endpoint, mtnPayload, {
+                headers,
+                timeout: 15000
+            });
+            console.log(`[MTN SMS] Outbound SMS accepted by ${endpoint}:`, outboundRes.data);
+            return outboundRes.data;
+        } catch (err) {
+            lastError = err;
+            console.warn(`[MTN SMS] Endpoint ${endpoint} returned HTTP ${err.response?.status || err.message}`);
+            if (err.response?.status !== 404) {
+                throw err;
+            }
+        }
+    }
+    throw lastError;
+}
+
+// --- DUAL NOTIFICATION DISPATCHER (FOR AUTOMATED SMS & WHATSAPP) ---
+async function dispatchDualNotification(phone, message) {
+    if (!phone) return;
+    try {
+        await sendWhatsAppMessage(phone, message);
+    } catch (waErr) {
+        console.warn('[DUAL DISPATCH] Baileys WhatsApp failed:', waErr.message);
+    }
+    try {
+        await sendSmsApi(phone, message);
+    } catch (smsErr) {
+        const errDetail = smsErr.response?.data ? JSON.stringify(smsErr.response.data) : smsErr.message;
+        console.error('[DUAL DISPATCH] Automated MTN SMS failed:', errDetail);
+    }
 }
 
 // --- AUTOMATED BACKGROUND CRON SCHEDULER (Every 10 minutes) ---
@@ -314,25 +367,22 @@ setInterval(async () => {
     try {
         const [pendingClients] = await pool.query(`
             SELECT clients.*, lawyers.firm_name FROM clients 
-            JOIN lawyers ON clients.lawyer_id = lawyers.id
+            JOIN lawyers ON clients.lawyer_id = lawyers.id 
             WHERE clients.created_at <= DATE_SUB(NOW(), INTERVAL 2 HOUR)
         `);
-
         for (const client of pendingClients) {
             const msg = `Dear ${client.full_name}, your information has been captured into the system by ${client.firm_name || 'our firm'}. Thank you for choosing our practice.`;
             await dispatchDualNotification(client.phone, msg);
         }
-
+        
         const [upcomingDeadlines] = await pool.query(`
-            SELECT court_deadlines.*, clients.phone as client_phone, clients.full_name as client_name, lawyers.firm_name 
-            FROM court_deadlines
-            JOIN matters ON court_deadlines.matter_id = matters.id
-            JOIN clients ON matters.client_id = clients.id
-            JOIN lawyers ON court_deadlines.lawyer_id = lawyers.id
-            WHERE court_deadlines.reminder_sent = 0
-            AND court_deadlines.due_date = DATE_ADD(CURDATE(), INTERVAL 2 DAY)
+            SELECT court_deadlines.*, clients.phone as client_phone, clients.full_name as client_name, lawyers.firm_name  
+            FROM court_deadlines 
+            JOIN matters ON court_deadlines.matter_id = matters.id 
+            JOIN clients ON matters.client_id = clients.id 
+            JOIN lawyers ON court_deadlines.lawyer_id = lawyers.id 
+            WHERE court_deadlines.reminder_sent = 0 AND court_deadlines.due_date = DATE_ADD(CURDATE(), INTERVAL 2 DAY)
         `);
-
         for (const dl of upcomingDeadlines) {
             if (dl.client_phone) {
                 const msg = `Reminder: Dear ${dl.client_name}, you have a scheduled court appearance or appointment ("${dl.title}") hosted by ${dl.firm_name} in 2 days on ${dl.due_date}.`;
@@ -349,11 +399,9 @@ setInterval(async () => {
 function authenticateToken(req, res, next) {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
-    
     if (!token) {
         return res.status(401).json({ error: 'Access token missing or unauthorized access attempt.' });
     }
-
     jwt.verify(token, JWT_SECRET, (err, user) => {
         if (err) {
             return res.status(403).json({ error: 'Token is invalid, malformed, or has expired.' });
@@ -378,7 +426,7 @@ app.get('/', (req, res) => {
         baileysSocket: sock?.user ? 'connected' : 'initializing',
         watiChatbotWebhook: 'active',
         smsGateway: 'active (MTN SMS v3 Spec - Strict Live)',
-        version: '5.9.3-production',
+        version: '5.9.4-production',
         timestamp: new Date().toISOString()
     });
 });
@@ -397,14 +445,12 @@ app.get('/api/health', async (req, res) => {
 // ============================================================================
 // 1. LAWYER AUTHENTICATION & PAYFAST R300 LICENSE SUBSYSTEM
 // ============================================================================
-
 app.post('/api/register', async (req, res) => {
     try {
         const { firmName, email, password } = req.body;
         if (!firmName || !email || !password) {
             return res.status(400).json({ error: 'All fields are strictly required.' });
         }
-
         const [existingLawyers] = await pool.query('SELECT id, payment_status FROM lawyers WHERE email = ?', [email]);
         if (existingLawyers.length > 0) {
             if (existingLawyers[0].payment_status === 'paid') {
@@ -422,16 +468,13 @@ app.post('/api/register', async (req, res) => {
                 });
             }
         }
-
         const hashedPassword = await bcrypt.hash(password, 12);
         const initialPaymentStatus = (email.toLowerCase() === 'tebogoanthony455@gmail.com') ? 'paid' : 'pending';
-
         const [result] = await pool.query(
             'INSERT INTO lawyers (firm_name, email, password_hash, payment_status) VALUES (?, ?, ?, ?)',
             [firmName, email, hashedPassword, initialPaymentStatus]
         );
-
-        res.status(201).json({ 
+        res.status(201).json({
             success: true,
             requiresPayment: initialPaymentStatus !== 'paid',
             amount: '300.00',
@@ -440,7 +483,7 @@ app.post('/api/register', async (req, res) => {
             email,
             firmName,
             lawyerId: result.insertId,
-            message: 'Account registered. Proceeding to PayFast R300 secure checkout.' 
+            message: 'Account registered. Proceeding to PayFast R300 secure checkout.'
         });
     } catch (err) {
         res.status(500).json({ error: 'Internal database error during user registration: ' + err.message });
@@ -470,25 +513,20 @@ app.post('/api/login', async (req, res) => {
         if (rows.length === 0) {
             return res.status(400).json({ error: 'Invalid email address or password combination.' });
         }
-
         const lawyer = rows[0];
         if (lawyer.payment_status !== 'paid' && email.toLowerCase() !== 'tebogoanthony455@gmail.com') {
             return res.status(403).json({ error: 'Account license fee unpaid. Please complete the R300 PayFast payment.' });
         }
-
         const storedHash = lawyer.password_hash || lawyer.password;
         let validPassword = storedHash && storedHash.startsWith('$2') ? await bcrypt.compare(password, storedHash) : false;
-
         if (!validPassword && email.toLowerCase() === 'tebogoanthony455@gmail.com' && password === 'Tebogo1234@') {
             const newHash = await bcrypt.hash('Tebogo1234@', 12);
             await pool.query('UPDATE lawyers SET password_hash = ?, payment_status = ? WHERE email = ?', [newHash, 'paid', email]);
             validPassword = true;
         }
-        
         if (!validPassword) {
             return res.status(400).json({ error: 'Invalid email address or password combination.' });
         }
-
         const token = jwt.sign({ id: lawyer.id, email: lawyer.email, firmName: lawyer.firm_name }, JWT_SECRET, { expiresIn: '24h' });
         res.status(200).json({ success: true, token, message: 'Authentication successful.', firmName: lawyer.firm_name });
     } catch (err) {
@@ -499,15 +537,16 @@ app.post('/api/login', async (req, res) => {
 // ============================================================================
 // 2. EXECUTIVE DASHBOARD ANALYTICS & METRICS SUBSYSTEM
 // ============================================================================
-
 app.get('/api/legal/stats', authenticateToken, async (req, res) => {
     try {
         const lawyerId = req.user.id;
         const [mattersCount] = await pool.query('SELECT COUNT(*) as count FROM matters WHERE lawyer_id = ?', [lawyerId]);
         const [clientsCount] = await pool.query('SELECT COUNT(*) as count FROM clients WHERE lawyer_id = ?', [lawyerId]);
         const [wipRows] = await pool.query('SELECT COALESCE(SUM(billable_hours * rate_per_hour), 0.00) as total FROM billable_time WHERE lawyer_id = ?', [lawyerId]);
-        const [trustRows] = await pool.query(`SELECT COALESCE(SUM(CASE WHEN transaction_type = 'deposit' THEN amount ELSE -amount END), 0.00) as balance FROM trust_ledgers WHERE lawyer_id = ?`, [lawyerId]);
-
+        const [trustRows] = await pool.query(`
+            SELECT COALESCE(SUM(CASE WHEN transaction_type = 'deposit' THEN amount ELSE -amount END), 0.00) as balance 
+            FROM trust_ledgers WHERE lawyer_id = ?
+        `, [lawyerId]);
         res.status(200).json({
             activeMatters: mattersCount[0]?.count || 0,
             totalClients: clientsCount[0]?.count || 0,
@@ -522,7 +561,6 @@ app.get('/api/legal/stats', authenticateToken, async (req, res) => {
 // ============================================================================
 // 3. CLIENT MANAGEMENT & CONFLICT SCREENING SUBSYSTEM
 // ============================================================================
-
 app.get('/api/legal/clients', authenticateToken, async (req, res) => {
     try {
         const [rows] = await pool.query('SELECT * FROM clients WHERE lawyer_id = ? ORDER BY id DESC', [req.user.id]);
@@ -538,26 +576,21 @@ app.post('/api/legal/clients', authenticateToken, async (req, res) => {
         if (!fullName || !email) {
             return res.status(400).json({ error: 'Client full name and email are mandatory parameters.' });
         }
-
         const [conflictCheck] = await pool.query(
             'SELECT id FROM clients WHERE lawyer_id = ? AND (email = ? OR id_number = ?)',
             [req.user.id, email, idNumber || '']
         );
-
         if (conflictCheck.length > 0) {
             return res.status(409).json({ error: 'Conflict of interest detected! Client with matching credentials already exists.' });
         }
-
         const [result] = await pool.query(
             'INSERT INTO clients (lawyer_id, full_name, email, phone, id_number) VALUES (?, ?, ?, ?, ?)',
             [req.user.id, fullName, email, phone, idNumber]
         );
-
         if (phone) {
             const welcomeMsg = `Dear ${fullName}, your client profile has been captured into the system by ${req.user.firmName}. Thank you for retaining our legal services.`;
             await dispatchDualNotification(phone, welcomeMsg);
         }
-
         res.status(201).json({ success: true, message: 'Client registered successfully with conflict screening completed.', clientId: result.insertId });
     } catch (err) {
         res.status(500).json({ error: 'Failed to create client record: ' + err.message });
@@ -567,14 +600,13 @@ app.post('/api/legal/clients', authenticateToken, async (req, res) => {
 // ============================================================================
 // 4. LITIGATION & MATTER MANAGEMENT SUBSYSTEM
 // ============================================================================
-
 app.get('/api/legal/matters', authenticateToken, async (req, res) => {
     try {
         const [rows] = await pool.query(`
-            SELECT matters.*, clients.full_name as client_name 
-            FROM matters 
-            JOIN clients ON matters.client_id = clients.id 
-            WHERE matters.lawyer_id = ? 
+            SELECT matters.*, clients.full_name as client_name  
+            FROM matters  
+            JOIN clients ON matters.client_id = clients.id  
+            WHERE matters.lawyer_id = ?  
             ORDER BY matters.id DESC
         `, [req.user.id]);
         res.status(200).json(rows);
@@ -599,15 +631,14 @@ app.post('/api/legal/matters', authenticateToken, async (req, res) => {
 // ============================================================================
 // 4.1. APPOINTMENTS SUBSYSTEM
 // ============================================================================
-
 app.get('/api/legal/appointments', authenticateToken, async (req, res) => {
     try {
         const [rows] = await pool.query(`
-            SELECT appointments.*, clients.full_name as client_name, clients.phone as client_phone, matters.title as matter_title 
-            FROM appointments 
-            JOIN clients ON appointments.client_id = clients.id 
-            LEFT JOIN matters ON appointments.matter_id = matters.id
-            WHERE appointments.lawyer_id = ? 
+            SELECT appointments.*, clients.full_name as client_name, clients.phone as client_phone, matters.title as matter_title  
+            FROM appointments  
+            JOIN clients ON appointments.client_id = clients.id  
+            LEFT JOIN matters ON appointments.matter_id = matters.id 
+            WHERE appointments.lawyer_id = ?  
             ORDER BY appointments.date_time ASC
         `, [req.user.id]);
         res.status(200).json(rows);
@@ -623,14 +654,12 @@ app.post('/api/legal/appointments', authenticateToken, async (req, res) => {
             'INSERT INTO appointments (lawyer_id, client_id, matter_id, date_time, reason, fee) VALUES (?, ?, ?, ?, ?, ?)',
             [req.user.id, clientId, matterId || null, dateTime, reason, fee || 0.00]
         );
-
         const [clientRows] = await pool.query('SELECT full_name, phone FROM clients WHERE id = ?', [clientId]);
         if (clientRows.length > 0 && clientRows[0].phone) {
             const client = clientRows[0];
             const apptMsg = `Dear ${client.full_name}, you have an appointment scheduled on ${new Date(dateTime).toLocaleString()} at ${req.user.firmName} for: "${reason}".`;
             await dispatchDualNotification(client.phone, apptMsg);
         }
-
         res.status(201).json({ success: true, message: 'Appointment saved successfully.', appointmentId: result.insertId });
     } catch (err) {
         res.status(500).json({ error: 'Failed to save appointment: ' + err.message });
@@ -640,14 +669,13 @@ app.post('/api/legal/appointments', authenticateToken, async (req, res) => {
 // ============================================================================
 // 5. SECURE DOCUMENT VAULT SUBSYSTEM
 // ============================================================================
-
 app.get('/api/legal/documents', authenticateToken, async (req, res) => {
     try {
         const [rows] = await pool.query(`
-            SELECT documents.id, documents.file_name, documents.file_type, documents.file_size, matters.title as matter_title 
-            FROM documents 
-            JOIN matters ON documents.matter_id = matters.id 
-            WHERE documents.lawyer_id = ? 
+            SELECT documents.id, documents.file_name, documents.file_type, documents.file_size, matters.title as matter_title  
+            FROM documents  
+            JOIN matters ON documents.matter_id = matters.id  
+            WHERE documents.lawyer_id = ?  
             ORDER BY documents.id DESC
         `, [req.user.id]);
         res.status(200).json(rows);
@@ -684,14 +712,11 @@ app.post('/api/legal/documents/send', authenticateToken, async (req, res) => {
         const { documentId, recipientPhone, channel } = req.body;
         const [docRows] = await pool.query('SELECT * FROM documents WHERE id = ? AND lawyer_id = ?', [documentId, req.user.id]);
         if (docRows.length === 0) return res.status(404).json({ error: 'Document not found.' });
-
         const doc = docRows[0];
         const msg = `Notice from ${req.user.firmName}: Document "${doc.file_name}" has been shared with you.`;
-
         if (channel === 'sms') await sendSmsApi(recipientPhone, msg);
         else if (channel === 'whatsapp') await sendWhatsAppMessage(recipientPhone, msg);
         else await dispatchDualNotification(recipientPhone, msg);
-
         res.status(200).json({ success: true, message: `Document successfully dispatched to ${recipientPhone}.` });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -701,13 +726,12 @@ app.post('/api/legal/documents/send', authenticateToken, async (req, res) => {
 // ============================================================================
 // 5.1. LAW FIRM JOB BOARD & RECRUITMENT SUBSYSTEM
 // ============================================================================
-
 app.get('/api/jobs', async (req, res) => {
     try {
         const [rows] = await pool.query(`
-            SELECT job_postings.*, lawyers.firm_name 
-            FROM job_postings 
-            JOIN lawyers ON job_postings.lawyer_id = lawyers.id 
+            SELECT job_postings.*, lawyers.firm_name  
+            FROM job_postings  
+            JOIN lawyers ON job_postings.lawyer_id = lawyers.id  
             ORDER BY job_postings.id DESC
         `);
         res.status(200).json(rows);
@@ -727,18 +751,17 @@ app.get('/api/legal/jobs', authenticateToken, async (req, res) => {
 
 app.post('/api/legal/jobs', authenticateToken, async (req, res) => {
     try {
-        const { 
-            jobTitle, companyIntro, department, referenceNumber, 
-            keyResponsibilities, requirements, employmentType, 
-            geographicLocation, workArrangement, perks, salaryRange, 
-            benefits, howToApply, requiredDocumentation, closingDate 
+        const {
+            jobTitle, companyIntro, department, referenceNumber,
+            keyResponsibilities, requirements, employmentType,
+            geographicLocation, workArrangement, perks, salaryRange,
+            benefits, howToApply, requiredDocumentation, closingDate
         } = req.body;
-
         const [result] = await pool.query(`
             INSERT INTO job_postings (
-                lawyer_id, job_title, company_intro, department, reference_number,
-                key_responsibilities, requirements, employment_type, geographic_location,
-                work_arrangement, perks, salary_range, benefits, how_to_apply,
+                lawyer_id, job_title, company_intro, department, reference_number, 
+                key_responsibilities, requirements, employment_type, geographic_location, 
+                work_arrangement, perks, salary_range, benefits, how_to_apply, 
                 required_documentation, closing_date
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `, [
@@ -747,7 +770,6 @@ app.post('/api/legal/jobs', authenticateToken, async (req, res) => {
             workArrangement, perks, salaryRange, benefits, howToApply,
             requiredDocumentation, closingDate
         ]);
-
         res.status(201).json({ success: true, message: 'Job posting published successfully.', jobId: result.insertId });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -757,7 +779,6 @@ app.post('/api/legal/jobs', authenticateToken, async (req, res) => {
 // ============================================================================
 // 5.2. SOUTH AFRICAN HR & PAYROLL SUBSYSTEM
 // ============================================================================
-
 app.get('/api/legal/hr/employees', authenticateToken, async (req, res) => {
     try {
         const [rows] = await pool.query('SELECT * FROM hr_employees WHERE lawyer_id = ? ORDER BY id DESC', [req.user.id]);
@@ -771,10 +792,11 @@ app.post('/api/legal/hr/employees', authenticateToken, async (req, res) => {
     try {
         const { fullName, idNumber, email, phone, position, department, employmentType, monthlySalary } = req.body;
         const [result] = await pool.query(`
-            INSERT INTO hr_employees (lawyer_id, full_name, id_number, email, phone, position, department, employment_type, monthly_salary)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO hr_employees (
+                lawyer_id, full_name, id_number, email, phone, position, 
+                department, employment_type, monthly_salary
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `, [req.user.id, fullName, idNumber, email, phone, position, department, employmentType || 'Permanent', monthlySalary]);
-
         res.status(201).json({ success: true, message: 'Employee added successfully.', employeeId: result.insertId });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -800,7 +822,6 @@ app.get('/api/legal/hr/payroll', authenticateToken, async (req, res) => {
             }
             const monthlyPaye = annualTax / 12;
             const netPay = gross - monthlyPaye - employeeUif;
-
             return {
                 id: emp.id,
                 fullName: emp.full_name,
@@ -821,10 +842,10 @@ app.get('/api/legal/hr/payroll', authenticateToken, async (req, res) => {
 app.get('/api/legal/hr/ir', authenticateToken, async (req, res) => {
     try {
         const [rows] = await pool.query(`
-            SELECT hr_ir_logs.*, hr_employees.full_name as employee_name 
-            FROM hr_ir_logs 
-            JOIN hr_employees ON hr_ir_logs.employee_id = hr_employees.id 
-            WHERE hr_ir_logs.lawyer_id = ? 
+            SELECT hr_ir_logs.*, hr_employees.full_name as employee_name  
+            FROM hr_ir_logs  
+            JOIN hr_employees ON hr_ir_logs.employee_id = hr_employees.id  
+            WHERE hr_ir_logs.lawyer_id = ?  
             ORDER BY hr_ir_logs.id DESC
         `, [req.user.id]);
         res.status(200).json(rows);
@@ -837,10 +858,10 @@ app.post('/api/legal/hr/ir', authenticateToken, async (req, res) => {
     try {
         const { employeeId, incidentType, description, actionTaken, status } = req.body;
         const [result] = await pool.query(`
-            INSERT INTO hr_ir_logs (lawyer_id, employee_id, incident_type, description, action_taken, status)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO hr_ir_logs (
+                lawyer_id, employee_id, incident_type, description, action_taken, status
+            ) VALUES (?, ?, ?, ?, ?, ?)
         `, [req.user.id, employeeId, incidentType || 'Disciplinary', description, actionTaken, status || 'Open']);
-
         res.status(201).json({ success: true, message: 'IR record created successfully.', logId: result.insertId });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -850,14 +871,13 @@ app.post('/api/legal/hr/ir', authenticateToken, async (req, res) => {
 // ============================================================================
 // 6. ACCOUNTING JOURNALS & TRUST ACCOUNTING
 // ============================================================================
-
 app.get('/api/legal/crj', authenticateToken, async (req, res) => {
     try {
         const [rows] = await pool.query(`
-            SELECT cash_receipt_journals.*, matters.title as matter_title 
-            FROM cash_receipt_journals 
-            JOIN matters ON cash_receipt_journals.matter_id = matters.id 
-            WHERE cash_receipt_journals.lawyer_id = ? 
+            SELECT cash_receipt_journals.*, matters.title as matter_title  
+            FROM cash_receipt_journals  
+            JOIN matters ON cash_receipt_journals.matter_id = matters.id  
+            WHERE cash_receipt_journals.lawyer_id = ?  
             ORDER BY cash_receipt_journals.receipt_date DESC
         `, [req.user.id]);
         res.status(200).json(rows);
@@ -869,10 +889,10 @@ app.get('/api/legal/crj', authenticateToken, async (req, res) => {
 app.get('/api/legal/trust', authenticateToken, async (req, res) => {
     try {
         const [rows] = await pool.query(`
-            SELECT trust_ledgers.*, matters.title as matter_title 
-            FROM trust_ledgers 
-            JOIN matters ON trust_ledgers.matter_id = matters.id 
-            WHERE trust_ledgers.lawyer_id = ? 
+            SELECT trust_ledgers.*, matters.title as matter_title  
+            FROM trust_ledgers  
+            JOIN matters ON trust_ledgers.matter_id = matters.id  
+            WHERE trust_ledgers.lawyer_id = ?  
             ORDER BY trust_ledgers.id DESC
         `, [req.user.id]);
         res.status(200).json(rows);
@@ -888,20 +908,17 @@ app.post('/api/legal/trust/deposit', authenticateToken, async (req, res) => {
             'INSERT INTO trust_ledgers (lawyer_id, matter_id, transaction_type, amount, description) VALUES (?, ?, ?, ?, ?)',
             [req.user.id, matterId, transactionType || 'deposit', amount, description || 'Trust movement']
         );
-
         const [matterRows] = await pool.query(`
-            SELECT matters.title, clients.full_name, clients.phone 
-            FROM matters 
-            JOIN clients ON matters.client_id = clients.id 
+            SELECT matters.title, clients.full_name, clients.phone  
+            FROM matters  
+            JOIN clients ON matters.client_id = clients.id  
             WHERE matters.id = ?
         `, [matterId]);
-
         if (matterRows.length > 0 && matterRows[0].phone) {
             const client = matterRows[0];
             const trustMsg = `Dear ${client.full_name}, your trust account has been updated with a ${transactionType} of R ${parseFloat(amount).toFixed(2)} at ${req.user.firmName}.`;
             await dispatchDualNotification(client.phone, trustMsg);
         }
-
         res.status(201).json({ success: true, message: 'Trust ledger transaction posted successfully and client notified via Baileys & SMS.', ledgerId: result.insertId });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -911,14 +928,13 @@ app.post('/api/legal/trust/deposit', authenticateToken, async (req, res) => {
 // ============================================================================
 // 7. COURT CALENDAR & DEADLINE SUBSYSTEM
 // ============================================================================
-
 app.get('/api/legal/calendar', authenticateToken, async (req, res) => {
     try {
         const [rows] = await pool.query(`
-            SELECT court_deadlines.*, matters.title as matter_title 
-            FROM court_deadlines 
-            JOIN matters ON court_deadlines.matter_id = matters.id 
-            WHERE court_deadlines.lawyer_id = ? 
+            SELECT court_deadlines.*, matters.title as matter_title  
+            FROM court_deadlines  
+            JOIN matters ON court_deadlines.matter_id = matters.id  
+            WHERE court_deadlines.lawyer_id = ?  
             ORDER BY court_deadlines.due_date ASC
         `, [req.user.id]);
         res.status(200).json(rows);
@@ -933,12 +949,10 @@ app.post('/api/legal/calendar', authenticateToken, async (req, res) => {
         const d = new Date(serviceDate);
         d.setDate(d.getDate() + parseInt(daysCount, 10));
         const dueDate = d.toISOString().split('T')[0];
-
         const [result] = await pool.query(
             'INSERT INTO court_deadlines (lawyer_id, matter_id, title, court_rule, service_date, days_count, due_date) VALUES (?, ?, ?, ?, ?, ?, ?)',
             [req.user.id, matterId, title || 'Filing Deadline', courtRule || 'High Court Rule 30', serviceDate, daysCount, dueDate]
         );
-
         res.status(201).json({ success: true, message: 'Court deadline scheduled successfully.', deadlineId: result.insertId, calculatedDueDate: dueDate });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -948,18 +962,17 @@ app.post('/api/legal/calendar', authenticateToken, async (req, res) => {
 // ============================================================================
 // 8. AI LEGAL ENGINE
 // ============================================================================
-
 app.post('/api/legal/ai/analyze', authenticateToken, async (req, res) => {
     try {
         const { matterId, actionType, inputText } = req.body;
-        let output = `=== AI LEGAL SUMMARY ===\n\nInput: "${inputText.substring(0, 200)}"\n\nAnalysis: Completed successfully under South African jurisdiction guidelines.`;
-
+        const safeInput = inputText ? inputText.substring(0, 200) : '';
+        const output = `=== AI LEGAL SUMMARY ===\n\nInput: "${safeInput}"\n\nAnalysis: Completed successfully under South African jurisdiction guidelines.`;
         const base64Output = Buffer.from(output).toString('base64');
+        const fileName = `AI_Analysis_${actionType || 'report'}.txt`;
         await pool.query(
             'INSERT INTO documents (lawyer_id, matter_id, file_name, file_type, file_size, content_base64) VALUES (?, ?, ?, ?, ?, ?)',
-            [req.user.id, matterId, `AI_Analysis_${actionType || 'report'}.txt`, 'text/plain', '2.0 KB', base64Output]
+            [req.user.id, matterId, fileName, 'text/plain', '2.0 KB', base64Output]
         );
-
         res.status(200).json({ success: true, message: 'AI Legal Engine executed and saved to vault.', output });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -969,22 +982,17 @@ app.post('/api/legal/ai/analyze', authenticateToken, async (req, res) => {
 // ============================================================================
 // 9. WATI CHATBOT WEBHOOK & BAILEYS / SMS GATEWAY SUBSYSTEMS
 // ============================================================================
-
 app.post('/api/legal/wati/webhook', async (req, res) => {
     try {
         const inboundData = req.body;
         const senderPhone = inboundData.waId || inboundData.senderPhone;
         const messageText = inboundData.text || inboundData.messageText;
-
         if (!senderPhone || !messageText) {
             return res.status(200).json({ status: 'Ignored non-text payload' });
         }
-
         console.log(`[WATI WEBHOOK] Inbound Message from +${senderPhone}: ${messageText}`);
-
         let replyText = "Hello! Welcome to L3 Legal System. Type 'help' for options, 'status' for case status, or 'contact' for office info.";
         const lowerMsg = messageText.toLowerCase().trim();
-
         if (lowerMsg.includes('help')) {
             replyText = "L3 Legal System Chatbot Menu:\n1. Type 'status' to check litigation.\n2. Type 'consult' to book an appointment.\n3. Type 'contact' for office details.";
         } else if (lowerMsg.includes('status')) {
@@ -994,7 +1002,6 @@ app.post('/api/legal/wati/webhook', async (req, res) => {
         } else if (lowerMsg.includes('contact')) {
             replyText = "L3 Legal Chambers, Kimberley, Northern Cape. Email: support@l3tech.co.za | Phone: 082 123 4567.";
         }
-
         await sendWatiTextMessage(senderPhone, replyText);
         res.status(200).json({ success: true, status: 'Webhook processed successfully' });
     } catch (err) {
@@ -1011,18 +1018,18 @@ app.post('/api/legal/sms/send', authenticateToken, async (req, res) => {
     try {
         const { phone, message, senderAddress } = req.body;
         const mtnResponse = await sendSmsApi(phone, message, senderAddress);
-        res.status(200).json({ 
-            success: true, 
-            message: 'SMS successfully dispatched via MTN SMS v3 API.', 
-            mtnGatewayResponse: mtnResponse 
+        res.status(200).json({
+            success: true,
+            message: 'SMS successfully dispatched via MTN SMS v3 API.',
+            mtnGatewayResponse: mtnResponse
         });
     } catch (err) {
         const statusCode = err.response?.status || 500;
         const errorDetail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
         console.error('[MTN SMS API Error Route]:', errorDetail);
-        res.status(statusCode).json({ 
-            success: false, 
-            error: `MTN SMS Gateway Error: ${errorDetail}` 
+        res.status(statusCode).json({
+            success: false,
+            error: `MTN SMS Gateway Error: ${errorDetail}`
         });
     }
 });
@@ -1030,7 +1037,6 @@ app.post('/api/legal/sms/send', authenticateToken, async (req, res) => {
 // ============================================================================
 // 10. GLOBAL ERROR CATCH-ALL & SERVER BINDING
 // ============================================================================
-
 app.use((req, res) => {
     res.status(404).json({ error: 'API endpoint route not found.' });
 });
@@ -1042,8 +1048,8 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-    console.log(`============================================================`);
+    console.log('============================================================');
     console.log(`L3 Legal System Backend Engine running on port ${PORT}`);
-    console.log(`Baileys Client Messaging, Wati Webhook, MTN SMS v3 Strict Live.`);
-    console.log(`============================================================`);
+    console.log('Baileys Client Messaging, Wati Webhook, MTN SMS v3 Strict Live.');
+    console.log('============================================================');
 });
