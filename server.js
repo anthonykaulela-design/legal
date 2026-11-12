@@ -254,40 +254,6 @@ async function sendWhatsAppMessage(phone, message) {
 }
 
 // --- MTN MADAPI SMS GATEWAY (FIXES 404 ROUTING & AUTH) ---
-async function getMtnAccessToken(baseHost) {
-    const credentials = Buffer.from(`${SMS_API_KEY}:${SMS_API_SECRET}`).toString('base64');
-    const tokenParams = new URLSearchParams();
-    tokenParams.append('grant_type', 'client_credentials');
-    tokenParams.append('client_id', SMS_API_KEY);
-    tokenParams.append('client_secret', SMS_API_SECRET);
-    
-    const tokenEndpoints = [
-        `${baseHost}/oauth/client_credential/accesstoken?grant_type=client_credentials`,
-        `${baseHost}/v1/oauth/access_token`
-    ];
-    
-    let lastErr;
-    for (const url of tokenEndpoints) {
-        try {
-            console.log(`[MTN SMS] Requesting OAuth token from ${url}...`);
-            const res = await axios.post(url, tokenParams.toString(), {
-                headers: {
-                    'Authorization': `Basic ${credentials}`,
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Ocp-Apim-Subscription-Key': SMS_API_KEY
-                },
-                timeout: 10000
-            });
-            const token = res.data.access_token || res.data.accessToken;
-            if (token) return token;
-        } catch (err) {
-            lastErr = err;
-            if (err.response?.status !== 404) throw err;
-        }
-    }
-    throw lastErr || new Error('Unable to acquire MTN OAuth token (404 on token endpoints).');
-}
-
 async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
     let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
     if (formattedPhone.startsWith('0')) {
@@ -297,9 +263,13 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
         throw new Error('Valid recipient phone number is required.');
     }
 
-    let rawBase = (process.env.MTN_BASE_URL || 'https://mtn.com').trim();
+    let rawBase = (process.env.MTN_BASE_URL || 'https://api.mtn.com').trim();
     if (!/^https?:\/\//i.test(rawBase)) {
         rawBase = 'https://' + rawBase;
+    }
+    // Prevent hitting MTN's WordPress website if www.mtn.com was entered in Render
+    if (/\/\/(www\.)?mtn\.com/i.test(rawBase)) {
+        rawBase = 'https://api.mtn.com';
     }
     const baseHost = rawBase.replace(/\/v\d+\/?$/, '').replace(/\/+$/, '');
 
