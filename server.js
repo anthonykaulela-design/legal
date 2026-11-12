@@ -253,16 +253,17 @@ async function sendWhatsAppMessage(phone, message) {
     return false;
 }
 
-// --- MTN MADAPI SMS GATEWAY (FIXED URL PROTOCOL) ---
+// --- MTN MADAPI SMS GATEWAY (FIXED URL & BODY SPEC) ---
 async function getMtnAccessToken(baseHost) {
     const credentials = Buffer.from(`${SMS_API_KEY}:${SMS_API_SECRET}`).toString('base64');
+    
     const tokenParams = new URLSearchParams();
     tokenParams.append('grant_type', 'client_credentials');
     tokenParams.append('client_id', SMS_API_KEY);
     tokenParams.append('client_secret', SMS_API_SECRET);
     
     const tokenEndpoints = [
-        `https://${baseHost}/oauth/client_credential/accesstoken?grant_type=client_credentials`,
+        `https://${baseHost}/oauth/client_credential/access_token`,
         `https://${baseHost}/v1/oauth/access_token`
     ];
     
@@ -282,7 +283,10 @@ async function getMtnAccessToken(baseHost) {
             if (token) return token;
         } catch (err) {
             lastErr = err;
-            if (err.response?.status !== 404) throw err;
+            console.warn(`[MTN SMS] Endpoint ${url} failed:`, err.response?.data || err.message);
+            if (err.response?.status && err.response.status !== 404) {
+                throw err;
+            }
         }
     }
     throw lastErr || new Error('Unable to acquire MTN OAuth token.');
@@ -426,7 +430,7 @@ app.get('/', (req, res) => {
         baileysSocket: sock?.user ? 'connected' : 'initializing',
         watiChatbotWebhook: 'active',
         smsGateway: 'active (MTN SMS v3 Spec - Strict Live)',
-        version: '5.9.5-production',
+        version: '5.9.6-production',
         timestamp: new Date().toISOString()
     });
 });
