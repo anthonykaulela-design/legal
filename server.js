@@ -253,7 +253,7 @@ async function sendWhatsAppMessage(phone, message) {
     return false;
 }
 
-// --- MTN MADAPI SMS GATEWAY (FIXED URL & BODY SPEC) ---
+// --- MTN MADAPI SMS GATEWAY (STRICT SPEC COMPLIANT) ---
 async function getMtnAccessToken(baseHost) {
     const credentials = Buffer.from(`${SMS_API_KEY}:${SMS_API_SECRET}`).toString('base64');
     
@@ -292,7 +292,7 @@ async function getMtnAccessToken(baseHost) {
     throw lastErr || new Error('Unable to acquire MTN OAuth token.');
 }
 
-async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
+async function sendSmsApi(phone, message, customSenderAddress = '27831234567') {
     let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
     if (formattedPhone.startsWith('0')) {
         formattedPhone = '27' + formattedPhone.substring(1);
@@ -306,10 +306,10 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
     const accessToken = await getMtnAccessToken(baseHost);
     console.log(`[MTN SMS] OAuth token acquired. Dispatching outbound SMS to +${formattedPhone}`);
     
-    const sender = process.env.MTN_SENDER_ADDRESS || customSenderAddress || 'L3Legal';
+    // Per official MTN v3.0.0 spec: senderAddress, receiverAddress (array), message, clientCorrelator
+    const sender = process.env.MTN_SENDER_ADDRESS || customSenderAddress || '27831234567';
     const mtnPayload = {
         senderAddress: sender,
-        cpAddress: 'L3_Chambers',
         receiverAddress: [formattedPhone],
         message: message,
         clientCorrelator: 'l3_corr_' + Date.now()
@@ -319,35 +319,23 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
         'Authorization': `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
         'Ocp-Apim-Subscription-Key': SMS_API_KEY,
-        'transactionId': crypto.randomUUID(),
-        'x-country-code': process.env.MTN_COUNTRY_CODE || 'ZAF'
+        'transactionId': crypto.randomUUID()
     };
 
-    const smsEndpoints = [
-        `https://${baseHost}/v3/messages/sms/outbound`,
-        `https://${baseHost}/v2/messages/sms/outbound`,
-        `https://${baseHost}/v1/messages/sms/outbound`
-    ];
+    const smsEndpoint = `https://${baseHost}/v1/messages/sms/outbound`;
 
-    let lastError;
-    for (const endpoint of smsEndpoints) {
-        try {
-            console.log(`[MTN SMS] Attempting dispatch via ${endpoint}...`);
-            const outboundRes = await axios.post(endpoint, mtnPayload, {
-                headers,
-                timeout: 15000
-            });
-            console.log(`[MTN SMS] Outbound SMS accepted by ${endpoint}:`, outboundRes.data);
-            return outboundRes.data;
-        } catch (err) {
-            lastError = err;
-            console.warn(`[MTN SMS] Endpoint ${endpoint} returned HTTP ${err.response?.status || err.message}`);
-            if (err.response?.status !== 404) {
-                throw err;
-            }
-        }
+    try {
+        console.log(`[MTN SMS] Attempting dispatch via ${smsEndpoint} with payload:`, JSON.stringify(mtnPayload));
+        const outboundRes = await axios.post(smsEndpoint, mtnPayload, {
+            headers,
+            timeout: 15000
+        });
+        console.log(`[MTN SMS] Outbound SMS accepted by ${smsEndpoint}:`, outboundRes.data);
+        return outboundRes.data;
+    } catch (err) {
+        console.error(`[MTN SMS] Endpoint ${smsEndpoint} failed with HTTP ${err.response?.status || err.message}:`, err.response?.data || err.message);
+        throw err;
     }
-    throw lastError;
 }
 
 // --- DUAL NOTIFICATION DISPATCHER (FOR AUTOMATED SMS & WHATSAPP) ---
@@ -430,7 +418,7 @@ app.get('/', (req, res) => {
         baileysSocket: sock?.user ? 'connected' : 'initializing',
         watiChatbotWebhook: 'active',
         smsGateway: 'active (MTN SMS v3 Spec - Strict Live)',
-        version: '5.9.6-production',
+        version: '5.9.7-production',
         timestamp: new Date().toISOString()
     });
 });
