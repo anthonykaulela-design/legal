@@ -253,7 +253,7 @@ async function sendWhatsAppMessage(phone, message) {
     return false;
 }
 
-// --- MTN MADAPI SMS GATEWAY (STRICT SPEC COMPLIANT) ---
+// --- MTN MADAPI SMS GATEWAY (STRICT LOCKED SENDER ADDRESS) ---
 async function getMtnAccessToken(baseHost) {
     const credentials = Buffer.from(`${SMS_API_KEY}:${SMS_API_SECRET}`).toString('base64');
     
@@ -292,7 +292,7 @@ async function getMtnAccessToken(baseHost) {
     throw lastErr || new Error('Unable to acquire MTN OAuth token.');
 }
 
-async function sendSmsApi(phone, message, customSenderAddress = '27831234567') {
+async function sendSmsApi(phone, message) {
     let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
     if (formattedPhone.startsWith('0')) {
         formattedPhone = '27' + formattedPhone.substring(1);
@@ -306,10 +306,12 @@ async function sendSmsApi(phone, message, customSenderAddress = '27831234567') {
     const accessToken = await getMtnAccessToken(baseHost);
     console.log(`[MTN SMS] OAuth token acquired. Dispatching outbound SMS to +${formattedPhone}`);
     
-    // Per official MTN v3.0.0 spec: senderAddress, receiverAddress (array), message, clientCorrelator
-    const sender = process.env.MTN_SENDER_ADDRESS || customSenderAddress || '27831234567';
+    // HARDLOCKED & UNDELETABLE SENDER ADDRESS FROM MTN PORTAL PROFILE (+27715694131)
+    const LOCKED_SENDER_ADDRESS = '27715694131';
+    
     const mtnPayload = {
-        senderAddress: sender,
+        senderAddress: LOCKED_SENDER_ADDRESS,
+        cpAddress: 'L3_Chambers',
         receiverAddress: [formattedPhone],
         message: message,
         clientCorrelator: 'l3_corr_' + Date.now()
@@ -325,7 +327,7 @@ async function sendSmsApi(phone, message, customSenderAddress = '27831234567') {
     const smsEndpoint = `https://${baseHost}/v1/messages/sms/outbound`;
 
     try {
-        console.log(`[MTN SMS] Attempting dispatch via ${smsEndpoint} with payload:`, JSON.stringify(mtnPayload));
+        console.log(`[MTN SMS] Attempting dispatch via ${smsEndpoint} with locked payload:`, JSON.stringify(mtnPayload));
         const outboundRes = await axios.post(smsEndpoint, mtnPayload, {
             headers,
             timeout: 15000
@@ -417,8 +419,8 @@ app.get('/', (req, res) => {
         system: 'L3 Legal Practice Management Suite & Enterprise POS',
         baileysSocket: sock?.user ? 'connected' : 'initializing',
         watiChatbotWebhook: 'active',
-        smsGateway: 'active (MTN SMS v3 Spec - Strict Live)',
-        version: '5.9.7-production',
+        smsGateway: 'active (MTN SMS v3 Spec - Locked MSISDN)',
+        version: '5.9.8-production',
         timestamp: new Date().toISOString()
     });
 });
@@ -1008,8 +1010,8 @@ app.get('/api/legal/whatsapp/qr', authenticateToken, (req, res) => {
 
 app.post('/api/legal/sms/send', authenticateToken, async (req, res) => {
     try {
-        const { phone, message, senderAddress } = req.body;
-        const mtnResponse = await sendSmsApi(phone, message, senderAddress);
+        const { phone, message } = req.body;
+        const mtnResponse = await sendSmsApi(phone, message);
         res.status(200).json({
             success: true,
             message: 'SMS successfully dispatched via MTN SMS v3 API.',
