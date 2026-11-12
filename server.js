@@ -296,12 +296,16 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
     if (!formattedPhone) {
         throw new Error('Valid recipient phone number is required.');
     }
-    
-    const rawBase = process.env.MTN_BASE_URL || 'api.mtn.com';
-    const baseHost = rawBase.replace(/\/v\d+\/?$/, '');
+
+    let rawBase = (process.env.MTN_BASE_URL || 'https://mtn.com').trim();
+    if (!/^https?:\/\//i.test(rawBase)) {
+        rawBase = 'https://' + rawBase;
+    }
+    const baseHost = rawBase.replace(/\/v\d+\/?$/, '').replace(/\/+$/, '');
+
     const accessToken = await getMtnAccessToken(baseHost);
     console.log(`[MTN SMS] OAuth token acquired. Dispatching outbound SMS to +${formattedPhone}`);
-    
+
     const sender = process.env.MTN_SENDER_ADDRESS || customSenderAddress || 'L3Legal';
     const mtnPayload = {
         senderAddress: sender,
@@ -310,7 +314,7 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
         message: message,
         clientCorrelator: 'l3_corr_' + Date.now()
     };
-    
+
     const headers = {
         'Authorization': `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
@@ -329,22 +333,18 @@ async function sendSmsApi(phone, message, customSenderAddress = 'L3Legal') {
     for (const endpoint of smsEndpoints) {
         try {
             console.log(`[MTN SMS] Attempting dispatch via ${endpoint}...`);
-            const outboundRes = await axios.post(endpoint, mtnPayload, {
-                headers,
-                timeout: 15000
-            });
+            const outboundRes = await axios.post(endpoint, mtnPayload, { headers, timeout: 15000 });
             console.log(`[MTN SMS] Outbound SMS accepted by ${endpoint}:`, outboundRes.data);
             return outboundRes.data;
         } catch (err) {
             lastError = err;
             console.warn(`[MTN SMS] Endpoint ${endpoint} returned HTTP ${err.response?.status || err.message}`);
-            if (err.response?.status !== 404) {
-                throw err;
-            }
+            if (err.response?.status !== 404) throw err;
         }
     }
     throw lastError;
 }
+
 
 // --- DUAL NOTIFICATION DISPATCHER (FOR AUTOMATED SMS & WHATSAPP) ---
 async function dispatchDualNotification(phone, message) {
