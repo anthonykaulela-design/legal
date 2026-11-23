@@ -4,7 +4,7 @@
  * Enterprise Full-Stack Backend Server (Node.js & Express)
  * Target Deployment: Render Cloud Hosting & TiDB Cloud Serverless (MySQL)
  * Complete with Multi-Tenant Baileys WhatsApp, MTN SMS v3 API Gateway,
- * Wati Webhook, First-6-Firms Free Activation & Deduplicated Messaging
+ * Wati Webhook, First-10-Firms Free Activation & Deduplicated Messaging
  * ============================================================================
  */
 
@@ -30,7 +30,7 @@ app.use(cors());
 const JWT_SECRET = process.env.JWT_SECRET || 'rsa_legal_practice_management_jwt_secret_key_2026';
 const SMS_API_KEY = process.env.SMS_API_KEY || 'JY34UmRwc3zyz1fba4XDKOLJGoiUaHTp';
 const SMS_API_SECRET = process.env.SMS_API_SECRET || '1w5OYKGoCAFTg3lK';
-const FREE_FIRM_LIMIT = 6;
+const FREE_FIRM_LIMIT = 10;
 
 // Wati Configuration for Inbound Chatbot Webhook
 const WATI_BASE_URL = process.env.WATI_BASE_URL || 'https://wati.io';
@@ -554,7 +554,7 @@ app.get('/', (req, res) => {
         freeFirmQuota: FREE_FIRM_LIMIT,
         watiChatbotWebhook: 'active',
         smsGateway: 'active (MTN SMS v3 Spec - Locked MSISDN + Deduplicated)',
-        version: '6.0.0-production',
+        version: '6.1.0-production',
         timestamp: new Date().toISOString()
     });
 });
@@ -577,7 +577,7 @@ app.get('/api/health', async (req, res) => {
 });
 
 // ============================================================================
-// 1. LAWYER AUTHENTICATION & FIRST-6-FIRMS FREE / PAYFAST R300 LICENSE SUBSYSTEM
+// 1. LAWYER AUTHENTICATION & FIRST-10-FIRMS FREE / PAYFAST R300 LICENSE SUBSYSTEM
 // ============================================================================
 app.post('/api/register', async (req, res) => {
     try {
@@ -604,7 +604,7 @@ app.post('/api/register', async (req, res) => {
         }
 
         const [countRows] = await pool.query('SELECT COUNT(*) AS totalFirms FROM lawyers');
-        const currentFirmCount = parseInt(countRows[0]?.totalFirms || 0, 10);
+        const currentFirmCount = Number(countRows[0]?.totalFirms || 0);
         const qualifiesForFreePromo = currentFirmCount < FREE_FIRM_LIMIT;
         const isAdminAccount = email.toLowerCase() === 'tebogoanthony455@gmail.com';
         const isFreeActivation = qualifiesForFreePromo || isAdminAccount;
@@ -633,7 +633,7 @@ app.post('/api/register', async (req, res) => {
             lawyerId: result.insertId,
             message: isFreeActivation
                 ? `Account registered with complimentary activation (Firm #${currentFirmCount + 1} of ${FREE_FIRM_LIMIT} free slots). You can sign in immediately.`
-                : 'Account registered. Complimentary 6-firm allocation is full; proceeding to PayFast R300 secure checkout.'
+                : 'Account registered. First 10 free law firm slots have been reached; proceeding to PayFast R300 secure checkout.'
         });
     } catch (err) {
         res.status(500).json({ error: 'Internal database error during user registration: ' + err.message });
