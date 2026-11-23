@@ -4,7 +4,8 @@
  * Enterprise Full-Stack Backend Server (Node.js & Express)
  * Target Deployment: Render Cloud Hosting & TiDB Cloud Serverless (MySQL)
  * Complete with Multi-Tenant Baileys WhatsApp, MTN SMS v3 API Gateway,
- * Wati Webhook, First-10-Firms Free Activation & Deduplicated Messaging
+ * Wati Webhook, First-10-Firms Free Activation, MySQL Direct-Insert Support
+ * & Deduplicated Messaging
  * ============================================================================
  */
 
@@ -176,7 +177,6 @@ async function initializeDatabaseTables() {
         console.error('[DATABASE INIT ERROR]:', err.message);
     }
 }
-initializeDatabaseTables();
 
 // --- MULTI-TENANT BAILEYS MESSAGING SOCKET MANAGER ---
 const whatsappSessions = new Map();
@@ -253,8 +253,38 @@ async function connectMessagingSocket(lawyerId = 'default') {
     return session;
 }
 
+// --- MYSQL DIRECT-INSERT FIRM PROVISIONER & POLLER ---
+const provisionedFirmIds = new Set();
+
+async function provisionMysqlLawFirms() {
+    try {
+        const [firms] = await pool.query(
+            'SELECT id, firm_name, email, password_hash, payment_status FROM lawyers ORDER BY id ASC'
+        );
+
+        firms.forEach((firm, index) => {
+            const slotNumber = index + 1;
+            const authDir = path.join(BASE_AUTH_DIR, `lawyer_${firm.id}`);
+
+            // Initialize tenant auth directory & WhatsApp socket slot for any firm present in MySQL
+            if (!provisionedFirmIds.has(firm.id)) {
+                provisionedFirmIds.add(firm.id);
+                fs.mkdirSync(authDir, { recursive: true });
+                connectMessagingSocket(firm.id);
+                console.log(`[MYSQL FIRM SYNC] Provisioned law firm #${firm.id} ("${firm.firm_name}", ${firm.email}) in slot ${slotNumber}.`);
+            }
+        });
+
+        return firms;
+    } catch (err) {
+        console.warn('[MYSQL FIRM SYNC WARNING]:', err.message);
+        return [];
+    }
+}
+
 async function restoreAllExistingTenantSessions() {
     try {
+        await provisionMysqlLawFirms();
         if (fs.existsSync(BASE_AUTH_DIR)) {
             const entries = fs.readdirSync(BASE_AUTH_DIR, { withFileTypes: true });
             for (const entry of entries) {
@@ -271,7 +301,12 @@ async function restoreAllExistingTenantSessions() {
     }
 }
 
-restoreAllExistingTenantSessions();
+(async () => {
+    await initializeDatabaseTables();
+    await restoreAllExistingTenantSessions();
+    // Poll MySQL every 30 seconds for law firms inserted directly via SQL
+    setInterval(provisionMysqlLawFirms, 30 * 1000);
+})();
 
 function normalizePhone(phone) {
     let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
@@ -552,9 +587,10 @@ app.get('/', (req, res) => {
         baileysSocket: connectedTenants.length > 0 ? `connected (${connectedTenants.length} tenant(s))` : 'multi-tenant ready',
         activeWhatsAppTenants: connectedTenants,
         freeFirmQuota: FREE_FIRM_LIMIT,
+        provisionedMysqlFirms: provisionedFirmIds.size,
         watiChatbotWebhook: 'active',
         smsGateway: 'active (MTN SMS v3 Spec - Locked MSISDN + Deduplicated)',
-        version: '6.1.0-production',
+        version: '6.2.0-production',
         timestamp: new Date().toISOString()
     });
 });
@@ -577,8 +613,26 @@ app.get('/api/health', async (req, res) => {
 });
 
 // ============================================================================
-// 1. LAWYER AUTHENTICATION & FIRST-10-FIRMS FREE / PAYFAST R300 LICENSE SUBSYSTEM
+// 1. LAWYER AUTHENTICATION, MYSQL DIRECT-INSERT SYNC & FIRST-10-FIRMS LICENSE
 // ============================================================================
+app.post('/api/admin/sync-mysql-firms', async (req, res) => {
+    try {
+        const firms = await provisionMysqlLawFirms();
+        res.status(200).json({
+            success: true,
+            syncedCount: firms.length,
+            firms: firms.map(f => ({
+                id: f.id,
+                firmName: f.firm_name,
+                email: f.email,
+                paymentStatus: f.payment_status
+            }))
+        });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to sync law firms from MySQL: ' + err.message });
+    }
+});
+
 app.post('/api/register', async (req, res) => {
     try {
         const { firmName, email, password } = req.body;
@@ -616,7 +670,7 @@ app.post('/api/register', async (req, res) => {
             [firmName, email, hashedPassword, initialPaymentStatus]
         );
 
-        // Pre-initialize multi-tenant WhatsApp session slot for the new firm
+        provisionedFirmIds.add(result.insertId);
         connectMessagingSocket(result.insertId);
 
         res.status(201).json({
@@ -667,18 +721,30 @@ app.post('/api/login', async (req, res) => {
         if (lawyer.payment_status !== 'paid' && email.toLowerCase() !== 'tebogoanthony455@gmail.com') {
             return res.status(403).json({ error: 'Account license fee unpaid. Please complete the R300 PayFast payment.' });
         }
-        const storedHash = lawyer.password_hash || lawyer.password;
-        let validPassword = storedHash && storedHash.startsWith('$2') ? await bcrypt.compare(password, storedHash) : false;
+
+        const storedHash = lawyer.password_hash || lawyer.password || '';
+        let validPassword = false;
+
+        if (storedHash.startsWith('$2')) {
+            validPassword = await bcrypt.compare(password, storedHash);
+        } else if (storedHash && password === storedHash) {
+            // Support law firms inserted directly into MySQL with a plain-text password and upgrade to bcrypt
+            const upgradedHash = await bcrypt.hash(password, 12);
+            await pool.query('UPDATE lawyers SET password_hash = ? WHERE id = ?', [upgradedHash, lawyer.id]);
+            validPassword = true;
+        }
+
         if (!validPassword && email.toLowerCase() === 'tebogoanthony455@gmail.com' && password === 'Tebogo1234@') {
             const newHash = await bcrypt.hash('Tebogo1234@', 12);
             await pool.query('UPDATE lawyers SET password_hash = ?, payment_status = ? WHERE email = ?', [newHash, 'paid', email]);
             validPassword = true;
         }
+
         if (!validPassword) {
             return res.status(400).json({ error: 'Invalid email address or password combination.' });
         }
 
-        // Ensure multi-tenant Baileys session is active/ready for this logged-in user
+        provisionedFirmIds.add(lawyer.id);
         connectMessagingSocket(lawyer.id);
 
         const token = jwt.sign({ id: lawyer.id, email: lawyer.email, firmName: lawyer.firm_name }, JWT_SECRET, { expiresIn: '24h' });
