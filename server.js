@@ -3,7 +3,8 @@
  * L3 LEGAL PRACTICE MANAGEMENT & ENTERPRISE POS SUITE
  * Enterprise Full-Stack Backend Server (Node.js & Express)
  * Target Deployment: Render Cloud Hosting & TiDB Cloud Serverless (MySQL)
- * Complete with Baileys Outbound Messaging, MTN SMS v3 API Gateway, Wati Webhook
+ * Complete with Multi-Tenant Baileys WhatsApp, MTN SMS v3 API Gateway,
+ * Wati Webhook, First-6-Firms Free Activation & Deduplicated Messaging
  * ============================================================================
  */
 
@@ -15,6 +16,8 @@ const cors = require('cors');
 const axios = require('axios');
 const pino = require('pino');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 
 // --- APPLICATION INITIALIZATION & CONFIGURATION ---
@@ -27,6 +30,7 @@ app.use(cors());
 const JWT_SECRET = process.env.JWT_SECRET || 'rsa_legal_practice_management_jwt_secret_key_2026';
 const SMS_API_KEY = process.env.SMS_API_KEY || 'JY34UmRwc3zyz1fba4XDKOLJGoiUaHTp';
 const SMS_API_SECRET = process.env.SMS_API_SECRET || '1w5OYKGoCAFTg3lK';
+const FREE_FIRM_LIMIT = 6;
 
 // Wati Configuration for Inbound Chatbot Webhook
 const WATI_BASE_URL = process.env.WATI_BASE_URL || 'https://wati.io';
@@ -148,6 +152,19 @@ async function initializeDatabaseTables() {
             )
         `);
 
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS notification_logs (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                lawyer_id INT NULL,
+                recipient_phone VARCHAR(50) NOT NULL,
+                channel VARCHAR(20) NOT NULL,
+                message_hash VARCHAR(64) NOT NULL,
+                message_preview VARCHAR(255) NULL,
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uniq_phone_channel_hash (recipient_phone, channel, message_hash)
+            )
+        `);
+
         try {
             await pool.query(`ALTER TABLE court_deadlines ADD COLUMN reminder_sent TINYINT(1) DEFAULT 0`);
         } catch (e) {
@@ -161,44 +178,139 @@ async function initializeDatabaseTables() {
 }
 initializeDatabaseTables();
 
-// --- SECURE BAILEYS MESSAGING SOCKET CLIENT INITIALIZATION ---
-let sock = null;
-let latestQR = null;
+// --- MULTI-TENANT BAILEYS MESSAGING SOCKET MANAGER ---
+const whatsappSessions = new Map();
+const BASE_AUTH_DIR = path.join(__dirname, 'auth_session_store');
 
-async function connectMessagingSocket() {
+function getOrCreateTenantSession(lawyerId) {
+    const key = String(lawyerId || 'default');
+    if (!whatsappSessions.has(key)) {
+        whatsappSessions.set(key, {
+            sock: null,
+            qr: null,
+            connecting: false,
+            reconnectTimer: null
+        });
+    }
+    return whatsappSessions.get(key);
+}
+
+async function connectMessagingSocket(lawyerId = 'default') {
+    const key = String(lawyerId || 'default');
+    const session = getOrCreateTenantSession(key);
+
+    if (session.connecting) {
+        return session;
+    }
+    session.connecting = true;
+
     try {
-        const { state, saveCreds } = await useMultiFileAuthState('auth_session_store');
-        sock = makeWASocket({
+        const authDir = path.join(BASE_AUTH_DIR, `lawyer_${key}`);
+        fs.mkdirSync(authDir, { recursive: true });
+
+        const { state, saveCreds } = await useMultiFileAuthState(authDir);
+        const sock = makeWASocket({
             auth: state,
             printQRInTerminal: false,
             logger: pino({ level: 'silent' })
         });
 
+        session.sock = sock;
+
         sock.ev.on('connection.update', (update) => {
             const { connection, lastDisconnect, qr } = update;
             if (qr) {
-                latestQR = qr;
-                console.log('[BAILEYS SOCKET] New QR Code generated for scanning.');
+                session.qr = qr;
+                console.log(`[BAILEYS SOCKET][Tenant ${key}] New QR Code generated for scanning.`);
             }
             if (connection === 'close') {
-                const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-                console.log('[BAILEYS SOCKET] Connection closed. Reconnecting:', shouldReconnect);
-                if (shouldReconnect) {
-                    connectMessagingSocket();
+                session.connecting = false;
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                console.log(`[BAILEYS SOCKET][Tenant ${key}] Connection closed. Reconnecting:`, shouldReconnect);
+                if (!shouldReconnect) {
+                    session.qr = null;
+                    session.sock = null;
+                } else if (!session.reconnectTimer) {
+                    session.reconnectTimer = setTimeout(() => {
+                        session.reconnectTimer = null;
+                        connectMessagingSocket(key);
+                    }, 3000);
                 }
             } else if (connection === 'open') {
-                latestQR = null;
-                console.log('[BAILEYS SOCKET] Connection opened successfully via Baileys.');
+                session.connecting = false;
+                session.qr = null;
+                console.log(`[BAILEYS SOCKET][Tenant ${key}] Connection opened successfully via Baileys.`);
             }
         });
 
         sock.ev.on('creds.update', saveCreds);
     } catch (err) {
-        console.error('[BAILEYS SOCKET] Failed to initialize socket:', err.message);
+        session.connecting = false;
+        console.error(`[BAILEYS SOCKET][Tenant ${key}] Failed to initialize socket:`, err.message);
+    }
+
+    return session;
+}
+
+async function restoreAllExistingTenantSessions() {
+    try {
+        if (fs.existsSync(BASE_AUTH_DIR)) {
+            const entries = fs.readdirSync(BASE_AUTH_DIR, { withFileTypes: true });
+            for (const entry of entries) {
+                if (entry.isDirectory() && entry.name.startsWith('lawyer_')) {
+                    const idPart = entry.name.replace('lawyer_', '');
+                    if (idPart) {
+                        await connectMessagingSocket(idPart);
+                    }
+                }
+            }
+        }
+    } catch (err) {
+        console.warn('[BAILEYS MULTI-TENANT] Session restore warning:', err.message);
     }
 }
 
-connectMessagingSocket();
+restoreAllExistingTenantSessions();
+
+function normalizePhone(phone) {
+    let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
+    if (formattedPhone.startsWith('0')) {
+        formattedPhone = '27' + formattedPhone.substring(1);
+    }
+    return formattedPhone;
+}
+
+function buildMessageHash(message) {
+    return crypto.createHash('sha256').update(String(message || '').trim()).digest('hex');
+}
+
+async function hasAlreadySent(formattedPhone, channel, messageHash) {
+    if (!formattedPhone || !messageHash) return false;
+    try {
+        const [rows] = await pool.query(
+            'SELECT id FROM notification_logs WHERE recipient_phone = ? AND channel = ? AND message_hash = ? LIMIT 1',
+            [formattedPhone, channel, messageHash]
+        );
+        return rows.length > 0;
+    } catch (err) {
+        console.warn('[DEDUP CHECK ERROR]:', err.message);
+        return false;
+    }
+}
+
+async function recordNotificationSent(lawyerId, formattedPhone, channel, message, messageHash) {
+    if (!formattedPhone || !messageHash) return;
+    try {
+        await pool.query(
+            `INSERT IGNORE INTO notification_logs (lawyer_id, recipient_phone, channel, message_hash, message_preview)
+             VALUES (?, ?, ?, ?, ?)`,
+            [lawyerId || null, formattedPhone, channel, messageHash, String(message || '').substring(0, 250)]
+        );
+    } catch (err) {
+        console.warn('[DEDUP RECORD ERROR]:', err.message);
+    }
+}
 
 // --- WATI CHATBOT HELPER ---
 async function sendWatiTextMessage(phone, message) {
@@ -231,29 +343,41 @@ async function sendWatiTextMessage(phone, message) {
     }
 }
 
-// --- WHATSAPP MESSAGING VIA BAILEYS FOR CLIENTS ---
-async function sendWhatsAppMessage(phone, message) {
-    let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
-    if (formattedPhone.startsWith('0')) {
-        formattedPhone = '27' + formattedPhone.substring(1);
+// --- MULTI-TENANT WHATSAPP MESSAGING VIA BAILEYS (DEDUPLICATED) ---
+async function sendWhatsAppMessage(phone, message, lawyerId = 'default', options = {}) {
+    const { force = false } = options;
+    const formattedPhone = normalizePhone(phone);
+    if (!formattedPhone) {
+        console.warn('[BAILEYS SOCKET] Phone missing.');
+        return false;
     }
-    
-    if (sock && formattedPhone) {
+
+    const messageHash = buildMessageHash(message);
+    if (!force && await hasAlreadySent(formattedPhone, 'whatsapp', messageHash)) {
+        console.log(`[BAILEYS SOCKET][Tenant ${lawyerId}] Duplicate WhatsApp suppressed for +${formattedPhone}.`);
+        return true;
+    }
+
+    const session = getOrCreateTenantSession(lawyerId);
+    const activeSock = session?.sock;
+
+    if (activeSock) {
         try {
             const jid = `${formattedPhone}@s.whatsapp.net`;
-            await sock.sendMessage(jid, { text: message });
-            console.log(`[BAILEYS SOCKET] WhatsApp message dispatched successfully to +${formattedPhone}`);
+            await activeSock.sendMessage(jid, { text: message });
+            await recordNotificationSent(lawyerId, formattedPhone, 'whatsapp', message, messageHash);
+            console.log(`[BAILEYS SOCKET][Tenant ${lawyerId}] WhatsApp message dispatched successfully to +${formattedPhone}`);
             return true;
         } catch (waErr) {
-            console.warn('[BAILEYS SOCKET] WhatsApp send failed:', waErr.message);
+            console.warn(`[BAILEYS SOCKET][Tenant ${lawyerId}] WhatsApp send failed:`, waErr.message);
             return false;
         }
     }
-    console.warn('[BAILEYS SOCKET] Socket not connected or phone missing.');
+    console.warn(`[BAILEYS SOCKET][Tenant ${lawyerId}] Socket not connected for this tenant.`);
     return false;
 }
 
-// --- MTN MADAPI SMS GATEWAY (STRICT LOCKED SENDER ADDRESS) ---
+// --- MTN MADAPI SMS GATEWAY (STRICT LOCKED SENDER ADDRESS & DEDUPLICATED) ---
 async function getMtnAccessToken(baseHost) {
     const credentials = Buffer.from(`${SMS_API_KEY}:${SMS_API_SECRET}`).toString('base64');
     
@@ -292,13 +416,17 @@ async function getMtnAccessToken(baseHost) {
     throw lastErr || new Error('Unable to acquire MTN OAuth token.');
 }
 
-async function sendSmsApi(phone, message) {
-    let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
-    if (formattedPhone.startsWith('0')) {
-        formattedPhone = '27' + formattedPhone.substring(1);
-    }
+async function sendSmsApi(phone, message, lawyerId = null, options = {}) {
+    const { force = false } = options;
+    const formattedPhone = normalizePhone(phone);
     if (!formattedPhone) {
         throw new Error('Valid recipient phone number is required.');
+    }
+
+    const messageHash = buildMessageHash(message);
+    if (!force && await hasAlreadySent(formattedPhone, 'sms', messageHash)) {
+        console.log(`[MTN SMS] Duplicate SMS suppressed for +${formattedPhone}.`);
+        return { deduplicated: true, status: 'ALREADY_SENT' };
     }
     
     const rawBase = process.env.MTN_BASE_URL || 'api.mtn.com';
@@ -332,6 +460,7 @@ async function sendSmsApi(phone, message) {
             headers,
             timeout: 15000
         });
+        await recordNotificationSent(lawyerId, formattedPhone, 'sms', message, messageHash);
         console.log(`[MTN SMS] Outbound SMS accepted by ${smsEndpoint}:`, outboundRes.data);
         return outboundRes.data;
     } catch (err) {
@@ -340,23 +469,23 @@ async function sendSmsApi(phone, message) {
     }
 }
 
-// --- DUAL NOTIFICATION DISPATCHER (FOR AUTOMATED SMS & WHATSAPP) ---
-async function dispatchDualNotification(phone, message) {
+// --- DUAL NOTIFICATION DISPATCHER (FOR AUTOMATED SMS & WHATSAPP, DEDUPLICATED) ---
+async function dispatchDualNotification(phone, message, lawyerId = 'default', options = {}) {
     if (!phone) return;
     try {
-        await sendWhatsAppMessage(phone, message);
+        await sendWhatsAppMessage(phone, message, lawyerId, options);
     } catch (waErr) {
         console.warn('[DUAL DISPATCH] Baileys WhatsApp failed:', waErr.message);
     }
     try {
-        await sendSmsApi(phone, message);
+        await sendSmsApi(phone, message, lawyerId, options);
     } catch (smsErr) {
         const errDetail = smsErr.response?.data ? JSON.stringify(smsErr.response.data) : smsErr.message;
         console.error('[DUAL DISPATCH] Automated MTN SMS failed:', errDetail);
     }
 }
 
-// --- AUTOMATED BACKGROUND CRON SCHEDULER (Every 10 minutes) ---
+// --- AUTOMATED BACKGROUND CRON SCHEDULER (Every 10 minutes, Deduplicated) ---
 setInterval(async () => {
     try {
         const [pendingClients] = await pool.query(`
@@ -366,7 +495,7 @@ setInterval(async () => {
         `);
         for (const client of pendingClients) {
             const msg = `Dear ${client.full_name}, your information has been captured into the system by ${client.firm_name || 'our firm'}. Thank you for choosing our practice.`;
-            await dispatchDualNotification(client.phone, msg);
+            await dispatchDualNotification(client.phone, msg, client.lawyer_id);
         }
         
         const [upcomingDeadlines] = await pool.query(`
@@ -380,7 +509,7 @@ setInterval(async () => {
         for (const dl of upcomingDeadlines) {
             if (dl.client_phone) {
                 const msg = `Reminder: Dear ${dl.client_name}, you have a scheduled court appearance or appointment ("${dl.title}") hosted by ${dl.firm_name} in 2 days on ${dl.due_date}.`;
-                await dispatchDualNotification(dl.client_phone, msg);
+                await dispatchDualNotification(dl.client_phone, msg, dl.lawyer_id);
                 await pool.query('UPDATE court_deadlines SET reminder_sent = 1 WHERE id = ?', [dl.id]);
             }
         }
@@ -414,13 +543,18 @@ app.use(auditLogger);
 
 // --- HEALTH CHECK & DIAGNOSTICS ENDPOINTS ---
 app.get('/', (req, res) => {
+    const connectedTenants = Array.from(whatsappSessions.entries())
+        .filter(([, s]) => !!s.sock?.user)
+        .map(([id]) => id);
     res.status(200).json({
         status: 'online',
         system: 'L3 Legal Practice Management Suite & Enterprise POS',
-        baileysSocket: sock?.user ? 'connected' : 'initializing',
+        baileysSocket: connectedTenants.length > 0 ? `connected (${connectedTenants.length} tenant(s))` : 'multi-tenant ready',
+        activeWhatsAppTenants: connectedTenants,
+        freeFirmQuota: FREE_FIRM_LIMIT,
         watiChatbotWebhook: 'active',
-        smsGateway: 'active (MTN SMS v3 Spec - Locked MSISDN)',
-        version: '5.9.8-production',
+        smsGateway: 'active (MTN SMS v3 Spec - Locked MSISDN + Deduplicated)',
+        version: '6.0.0-production',
         timestamp: new Date().toISOString()
     });
 });
@@ -430,14 +564,20 @@ app.get('/api/health', async (req, res) => {
         const connection = await pool.getConnection();
         await connection.ping();
         connection.release();
-        res.status(200).json({ database: 'connected', baileys: sock?.user ? 'active' : 'connecting', watiWebhook: 'active', smsGateway: 'active', status: 'healthy' });
+        res.status(200).json({
+            database: 'connected',
+            baileys: 'multi-tenant-active',
+            watiWebhook: 'active',
+            smsGateway: 'active',
+            status: 'healthy'
+        });
     } catch (dbError) {
         res.status(500).json({ database: 'disconnected', error: dbError.message });
     }
 });
 
 // ============================================================================
-// 1. LAWYER AUTHENTICATION & PAYFAST R300 LICENSE SUBSYSTEM
+// 1. LAWYER AUTHENTICATION & FIRST-6-FIRMS FREE / PAYFAST R300 LICENSE SUBSYSTEM
 // ============================================================================
 app.post('/api/register', async (req, res) => {
     try {
@@ -462,22 +602,38 @@ app.post('/api/register', async (req, res) => {
                 });
             }
         }
+
+        const [countRows] = await pool.query('SELECT COUNT(*) AS totalFirms FROM lawyers');
+        const currentFirmCount = parseInt(countRows[0]?.totalFirms || 0, 10);
+        const qualifiesForFreePromo = currentFirmCount < FREE_FIRM_LIMIT;
+        const isAdminAccount = email.toLowerCase() === 'tebogoanthony455@gmail.com';
+        const isFreeActivation = qualifiesForFreePromo || isAdminAccount;
+
         const hashedPassword = await bcrypt.hash(password, 12);
-        const initialPaymentStatus = (email.toLowerCase() === 'tebogoanthony455@gmail.com') ? 'paid' : 'pending';
+        const initialPaymentStatus = isFreeActivation ? 'paid' : 'pending';
         const [result] = await pool.query(
             'INSERT INTO lawyers (firm_name, email, password_hash, payment_status) VALUES (?, ?, ?, ?)',
             [firmName, email, hashedPassword, initialPaymentStatus]
         );
+
+        // Pre-initialize multi-tenant WhatsApp session slot for the new firm
+        connectMessagingSocket(result.insertId);
+
         res.status(201).json({
             success: true,
-            requiresPayment: initialPaymentStatus !== 'paid',
+            requiresPayment: !isFreeActivation,
+            freePromoApplied: qualifiesForFreePromo,
+            firmSlot: currentFirmCount + 1,
+            freeLimit: FREE_FIRM_LIMIT,
             amount: '300.00',
             merchantId: '32880521',
             merchantKey: 'wfx9nr9j9cvlm',
             email,
             firmName,
             lawyerId: result.insertId,
-            message: 'Account registered. Proceeding to PayFast R300 secure checkout.'
+            message: isFreeActivation
+                ? `Account registered with complimentary activation (Firm #${currentFirmCount + 1} of ${FREE_FIRM_LIMIT} free slots). You can sign in immediately.`
+                : 'Account registered. Complimentary 6-firm allocation is full; proceeding to PayFast R300 secure checkout.'
         });
     } catch (err) {
         res.status(500).json({ error: 'Internal database error during user registration: ' + err.message });
@@ -521,6 +677,10 @@ app.post('/api/login', async (req, res) => {
         if (!validPassword) {
             return res.status(400).json({ error: 'Invalid email address or password combination.' });
         }
+
+        // Ensure multi-tenant Baileys session is active/ready for this logged-in user
+        connectMessagingSocket(lawyer.id);
+
         const token = jwt.sign({ id: lawyer.id, email: lawyer.email, firmName: lawyer.firm_name }, JWT_SECRET, { expiresIn: '24h' });
         res.status(200).json({ success: true, token, message: 'Authentication successful.', firmName: lawyer.firm_name });
     } catch (err) {
@@ -582,8 +742,8 @@ app.post('/api/legal/clients', authenticateToken, async (req, res) => {
             [req.user.id, fullName, email, phone, idNumber]
         );
         if (phone) {
-            const welcomeMsg = `Dear ${fullName}, your client profile has been captured into the system by ${req.user.firmName}. Thank you for retaining our legal services.`;
-            await dispatchDualNotification(phone, welcomeMsg);
+            const welcomeMsg = `Dear ${fullName}, your client profile (#${result.insertId}) has been captured into the system by ${req.user.firmName}. Thank you for retaining our legal services.`;
+            await dispatchDualNotification(phone, welcomeMsg, req.user.id);
         }
         res.status(201).json({ success: true, message: 'Client registered successfully with conflict screening completed.', clientId: result.insertId });
     } catch (err) {
@@ -651,8 +811,8 @@ app.post('/api/legal/appointments', authenticateToken, async (req, res) => {
         const [clientRows] = await pool.query('SELECT full_name, phone FROM clients WHERE id = ?', [clientId]);
         if (clientRows.length > 0 && clientRows[0].phone) {
             const client = clientRows[0];
-            const apptMsg = `Dear ${client.full_name}, you have an appointment scheduled on ${new Date(dateTime).toLocaleString()} at ${req.user.firmName} for: "${reason}".`;
-            await dispatchDualNotification(client.phone, apptMsg);
+            const apptMsg = `Dear ${client.full_name}, appointment #${result.insertId} is scheduled on ${new Date(dateTime).toLocaleString()} at ${req.user.firmName} for: "${reason}".`;
+            await dispatchDualNotification(client.phone, apptMsg, req.user.id);
         }
         res.status(201).json({ success: true, message: 'Appointment saved successfully.', appointmentId: result.insertId });
     } catch (err) {
@@ -707,10 +867,11 @@ app.post('/api/legal/documents/send', authenticateToken, async (req, res) => {
         const [docRows] = await pool.query('SELECT * FROM documents WHERE id = ? AND lawyer_id = ?', [documentId, req.user.id]);
         if (docRows.length === 0) return res.status(404).json({ error: 'Document not found.' });
         const doc = docRows[0];
-        const msg = `Notice from ${req.user.firmName}: Document "${doc.file_name}" has been shared with you.`;
-        if (channel === 'sms') await sendSmsApi(recipientPhone, msg);
-        else if (channel === 'whatsapp') await sendWhatsAppMessage(recipientPhone, msg);
-        else await dispatchDualNotification(recipientPhone, msg);
+        const dispatchRef = crypto.randomBytes(3).toString('hex').toUpperCase();
+        const msg = `Notice from ${req.user.firmName} [Ref:${dispatchRef}]: Document "${doc.file_name}" has been shared with you.`;
+        if (channel === 'sms') await sendSmsApi(recipientPhone, msg, req.user.id);
+        else if (channel === 'whatsapp') await sendWhatsAppMessage(recipientPhone, msg, req.user.id);
+        else await dispatchDualNotification(recipientPhone, msg, req.user.id);
         res.status(200).json({ success: true, message: `Document successfully dispatched to ${recipientPhone}.` });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -910,8 +1071,8 @@ app.post('/api/legal/trust/deposit', authenticateToken, async (req, res) => {
         `, [matterId]);
         if (matterRows.length > 0 && matterRows[0].phone) {
             const client = matterRows[0];
-            const trustMsg = `Dear ${client.full_name}, your trust account has been updated with a ${transactionType} of R ${parseFloat(amount).toFixed(2)} at ${req.user.firmName}.`;
-            await dispatchDualNotification(client.phone, trustMsg);
+            const trustMsg = `Dear ${client.full_name}, trust ledger #${result.insertId} updated with a ${transactionType} of R ${parseFloat(amount).toFixed(2)} at ${req.user.firmName}.`;
+            await dispatchDualNotification(client.phone, trustMsg, req.user.id);
         }
         res.status(201).json({ success: true, message: 'Trust ledger transaction posted successfully and client notified via Baileys & SMS.', ledgerId: result.insertId });
     } catch (err) {
@@ -974,7 +1135,7 @@ app.post('/api/legal/ai/analyze', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
-// 9. WATI CHATBOT WEBHOOK & BAILEYS / SMS GATEWAY SUBSYSTEMS
+// 9. WATI CHATBOT WEBHOOK & MULTI-TENANT BAILEYS / SMS GATEWAY SUBSYSTEMS
 // ============================================================================
 app.post('/api/legal/wati/webhook', async (req, res) => {
     try {
@@ -1004,17 +1165,27 @@ app.post('/api/legal/wati/webhook', async (req, res) => {
     }
 });
 
-app.get('/api/legal/whatsapp/qr', authenticateToken, (req, res) => {
-    res.status(200).json({ connected: !!sock?.user, qr: latestQR, user: sock?.user || null });
+app.get('/api/legal/whatsapp/qr', authenticateToken, async (req, res) => {
+    const session = await connectMessagingSocket(req.user.id);
+    res.status(200).json({
+        tenantId: req.user.id,
+        connected: !!session?.sock?.user,
+        qr: session?.qr || null,
+        user: session?.sock?.user || null
+    });
 });
 
 app.post('/api/legal/sms/send', authenticateToken, async (req, res) => {
     try {
         const { phone, message } = req.body;
-        const mtnResponse = await sendSmsApi(phone, message);
+        const mtnResponse = await sendSmsApi(phone, message, req.user.id);
+        const alreadySent = !!mtnResponse?.deduplicated;
         res.status(200).json({
             success: true,
-            message: 'SMS successfully dispatched via MTN SMS v3 API.',
+            deduplicated: alreadySent,
+            message: alreadySent
+                ? 'Identical SMS already sent to this recipient; skipped duplicate dispatch.'
+                : 'SMS successfully dispatched via MTN SMS v3 API.',
             mtnGatewayResponse: mtnResponse
         });
     } catch (err) {
@@ -1044,6 +1215,6 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log('============================================================');
     console.log(`L3 Legal System Backend Engine running on port ${PORT}`);
-    console.log('Baileys Client Messaging, Wati Webhook, MTN SMS v3 Strict Live.');
+    console.log('Multi-Tenant Baileys, Wati Webhook, MTN SMS v3 Locked & Deduplicated.');
     console.log('============================================================');
 });
