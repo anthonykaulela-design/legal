@@ -3,7 +3,7 @@
  * L3 LEGAL PRACTICE MANAGEMENT & ENTERPRISE POS SUITE
  * Enterprise Full-Stack Backend Server (Node.js & Express)
  * Target Deployment: Render Cloud Hosting & TiDB Cloud Serverless (MySQL)
- * Complete with Multi-Tenant Baileys WhatsApp, MTN SMS v3 API Gateway,
+ * Complete with Multi-Tenant Baileys WhatsApp, MTN SMS v3.0.0 API Gateway,
  * Wati Webhook, First-10-Firms Free Activation, MySQL Direct-Insert Support
  * & Deduplicated Messaging
  * ============================================================================
@@ -266,7 +266,6 @@ async function provisionMysqlLawFirms() {
             const slotNumber = index + 1;
             const authDir = path.join(BASE_AUTH_DIR, `lawyer_${firm.id}`);
 
-            // Initialize tenant auth directory & WhatsApp socket slot for any firm present in MySQL
             if (!provisionedFirmIds.has(firm.id)) {
                 provisionedFirmIds.add(firm.id);
                 fs.mkdirSync(authDir, { recursive: true });
@@ -304,16 +303,19 @@ async function restoreAllExistingTenantSessions() {
 (async () => {
     await initializeDatabaseTables();
     await restoreAllExistingTenantSessions();
-    // Poll MySQL every 30 seconds for law firms inserted directly via SQL
     setInterval(provisionMysqlLawFirms, 30 * 1000);
 })();
 
-function normalizePhone(phone) {
-    let formattedPhone = phone ? phone.toString().replace(/\D/g, '') : '';
-    if (formattedPhone.startsWith('0')) {
-        formattedPhone = '27' + formattedPhone.substring(1);
+function formatMsisdn(phone) {
+    let digits = phone ? String(phone).replace(/\D/g, '') : '';
+    if (digits.startsWith('0')) {
+        digits = '27' + digits.slice(1);
     }
-    return formattedPhone;
+    return digits;
+}
+
+function normalizePhone(phone) {
+    return formatMsisdn(phone);
 }
 
 function buildMessageHash(message) {
@@ -412,50 +414,37 @@ async function sendWhatsAppMessage(phone, message, lawyerId = 'default', options
     return false;
 }
 
-// --- MTN MADAPI SMS GATEWAY (STRICT LOCKED SENDER ADDRESS & DEDUPLICATED) ---
-async function getMtnAccessToken(baseHost) {
+// --- MTN MADAPI MESSAGING SMS v3.0.0 GATEWAY (DEDUPLICATED) ---
+async function getMtnAccessToken() {
+    const tokenUrl = process.env.MTN_TOKEN_URL || 'https://api.mtn.com/v1/oauth/access_token';
     const credentials = Buffer.from(`${SMS_API_KEY}:${SMS_API_SECRET}`).toString('base64');
-    
-    const tokenParams = new URLSearchParams();
-    tokenParams.append('grant_type', 'client_credentials');
-    tokenParams.append('client_id', SMS_API_KEY);
-    tokenParams.append('client_secret', SMS_API_SECRET);
-    
-    const tokenEndpoints = [
-        `https://${baseHost}/oauth/client_credential/access_token`,
-        `https://${baseHost}/v1/oauth/access_token`
-    ];
-    
-    let lastErr;
-    for (const url of tokenEndpoints) {
-        try {
-            console.log(`[MTN SMS] Requesting OAuth token from ${url}...`);
-            const res = await axios.post(url, tokenParams.toString(), {
-                headers: {
-                    'Authorization': `Basic ${credentials}`,
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Ocp-Apim-Subscription-Key': SMS_API_KEY
-                },
-                timeout: 10000
-            });
-            const token = res.data.access_token || res.data.accessToken;
-            if (token) return token;
-        } catch (err) {
-            lastErr = err;
-            console.warn(`[MTN SMS] Endpoint ${url} failed:`, err.response?.data || err.message);
-            if (err.response?.status && err.response.status !== 404) {
-                throw err;
-            }
-        }
+
+    const params = new URLSearchParams();
+    params.append('grant_type', 'client_credentials');
+
+    const res = await axios.post(tokenUrl, params.toString(), {
+        headers: {
+            'Authorization': `Basic ${credentials}`,
+            'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        timeout: 10000
+    });
+
+    const token = res.data?.access_token || res.data?.accessToken;
+    if (!token) {
+        throw new Error('MTN OAuth response did not include an access_token.');
     }
-    throw lastErr || new Error('Unable to acquire MTN OAuth token.');
+    return token;
 }
 
 async function sendSmsApi(phone, message, lawyerId = null, options = {}) {
     const { force = false } = options;
-    const formattedPhone = normalizePhone(phone);
+    const formattedPhone = formatMsisdn(phone);
     if (!formattedPhone) {
         throw new Error('Valid recipient phone number is required.');
+    }
+    if (!message || !String(message).trim()) {
+        throw new Error('SMS message text is required.');
     }
 
     const messageHash = buildMessageHash(message);
@@ -463,43 +452,54 @@ async function sendSmsApi(phone, message, lawyerId = null, options = {}) {
         console.log(`[MTN SMS] Duplicate SMS suppressed for +${formattedPhone}.`);
         return { deduplicated: true, status: 'ALREADY_SENT' };
     }
-    
-    const rawBase = process.env.MTN_BASE_URL || 'api.mtn.com';
-    const baseHost = rawBase.replace(/^https?:\/\//, '').replace(/\/v\d+\/?$/, '');
-    const accessToken = await getMtnAccessToken(baseHost);
-    console.log(`[MTN SMS] OAuth token acquired. Dispatching outbound SMS to +${formattedPhone}`);
-    
-    // HARDLOCKED & UNDELETABLE SENDER ADDRESS FROM MTN PORTAL PROFILE (+27715694131)
-    const LOCKED_SENDER_ADDRESS = '27715694131';
-    
-    const mtnPayload = {
-        senderAddress: LOCKED_SENDER_ADDRESS,
-        cpAddress: 'L3_Chambers',
+
+    const baseUrl = (process.env.MTN_BASE_URL || 'https://api.mtn.com/v1').replace(/\/+$/, '');
+    const senderAddress = String(process.env.MTN_SENDER_ADDRESS || '27715694131').trim();
+    const transactionId = crypto.randomUUID();
+    const clientCorrelator = `l3_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+
+    const accessToken = await getMtnAccessToken();
+
+    const payload = {
+        senderAddress,
         receiverAddress: [formattedPhone],
-        message: message,
-        clientCorrelator: 'l3_corr_' + Date.now()
+        message: String(message),
+        clientCorrelator
     };
-    
+
+    if (process.env.MTN_CP_ADDRESS && process.env.MTN_CP_ADDRESS.trim()) {
+        payload.cpAddress = process.env.MTN_CP_ADDRESS.trim();
+    }
+
     const headers = {
         'Authorization': `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
-        'Ocp-Apim-Subscription-Key': SMS_API_KEY,
-        'transactionId': crypto.randomUUID()
+        'transactionId': transactionId
     };
 
-    const smsEndpoint = `https://${baseHost}/v1/messages/sms/outbound`;
+    const url = `${baseUrl}/messages/sms/outbound`;
 
     try {
-        console.log(`[MTN SMS] Attempting dispatch via ${smsEndpoint} with locked payload:`, JSON.stringify(mtnPayload));
-        const outboundRes = await axios.post(smsEndpoint, mtnPayload, {
+        const response = await axios.post(url, payload, {
             headers,
             timeout: 15000
         });
+
         await recordNotificationSent(lawyerId, formattedPhone, 'sms', message, messageHash);
-        console.log(`[MTN SMS] Outbound SMS accepted by ${smsEndpoint}:`, outboundRes.data);
-        return outboundRes.data;
+        return {
+            ...response.data,
+            transactionId: response.data?.transactionId || transactionId
+        };
     } catch (err) {
-        console.error(`[MTN SMS] Endpoint ${smsEndpoint} failed with HTTP ${err.response?.status || err.message}:`, err.response?.data || err.message);
+        const apiError = err.response?.data || {};
+        console.error('[MTN SMS v3 ERROR]', {
+            httpStatus: err.response?.status || null,
+            statusCode: apiError.statusCode || null,
+            statusMessage: apiError.statusMessage || err.message,
+            supportMessage: apiError.supportMessage || null,
+            downstreamStatusCode: apiError.downstreamStatusCode || null,
+            transactionId: apiError.transactionId || transactionId
+        });
         throw err;
     }
 }
@@ -532,7 +532,7 @@ setInterval(async () => {
             const msg = `Dear ${client.full_name}, your information has been captured into the system by ${client.firm_name || 'our firm'}. Thank you for choosing our practice.`;
             await dispatchDualNotification(client.phone, msg, client.lawyer_id);
         }
-        
+
         const [upcomingDeadlines] = await pool.query(`
             SELECT court_deadlines.*, clients.phone as client_phone, clients.full_name as client_name, lawyers.firm_name  
             FROM court_deadlines 
@@ -589,8 +589,8 @@ app.get('/', (req, res) => {
         freeFirmQuota: FREE_FIRM_LIMIT,
         provisionedMysqlFirms: provisionedFirmIds.size,
         watiChatbotWebhook: 'active',
-        smsGateway: 'active (MTN SMS v3 Spec - Locked MSISDN + Deduplicated)',
-        version: '6.2.0-production',
+        smsGateway: 'active (MTN Messaging SMS v3.0.0)',
+        version: '6.3.0-production',
         timestamp: new Date().toISOString()
     });
 });
@@ -728,7 +728,6 @@ app.post('/api/login', async (req, res) => {
         if (storedHash.startsWith('$2')) {
             validPassword = await bcrypt.compare(password, storedHash);
         } else if (storedHash && password === storedHash) {
-            // Support law firms inserted directly into MySQL with a plain-text password and upgrade to bcrypt
             const upgradedHash = await bcrypt.hash(password, 12);
             await pool.query('UPDATE lawyers SET password_hash = ? WHERE id = ?', [upgradedHash, lawyer.id]);
             validPassword = true;
@@ -1251,16 +1250,17 @@ app.post('/api/legal/sms/send', authenticateToken, async (req, res) => {
             deduplicated: alreadySent,
             message: alreadySent
                 ? 'Identical SMS already sent to this recipient; skipped duplicate dispatch.'
-                : 'SMS successfully dispatched via MTN SMS v3 API.',
+                : 'SMS successfully dispatched via MTN SMS v3.0.0 API.',
             mtnGatewayResponse: mtnResponse
         });
     } catch (err) {
-        const statusCode = err.response?.status || 500;
-        const errorDetail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
-        console.error('[MTN SMS API Error Route]:', errorDetail);
+        const statusCode = err.response?.status || 400;
+        const apiError = err.response?.data;
+        console.error('[MTN SMS API Error Route]:', apiError || err.message);
         res.status(statusCode).json({
             success: false,
-            error: `MTN SMS Gateway Error: ${errorDetail}`
+            error: apiError?.statusMessage || err.message,
+            mtnError: apiError || { message: err.message }
         });
     }
 });
@@ -1281,6 +1281,6 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
     console.log('============================================================');
     console.log(`L3 Legal System Backend Engine running on port ${PORT}`);
-    console.log('Multi-Tenant Baileys, Wati Webhook, MTN SMS v3 Locked & Deduplicated.');
+    console.log('Multi-Tenant Baileys, Wati Webhook, MTN SMS v3.0.0 & Deduplicated.');
     console.log('============================================================');
 });
