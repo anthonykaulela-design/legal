@@ -491,6 +491,16 @@ async function sendSmsApi(phone, message, lawyerId = null, options = {}) {
 
     const url = `${baseUrl}${endpointPath}`;
 
+    console.log('[MTN SMS v3 OUTGOING REQUEST]:', {
+        url,
+        headers: {
+            'Content-Type': headers['Content-Type'],
+            'transactionId': headers['transactionId'],
+            'Authorization': 'Bearer [REDACTED]'
+        },
+        payload
+    });
+
     try {
         const response = await axios.post(url, payload, {
             headers,
@@ -506,7 +516,6 @@ async function sendSmsApi(phone, message, lawyerId = null, options = {}) {
         const apiError = err.response?.data || { message: err.message };
         console.error('[MTN SMS v3 ERROR DETAILS]:', {
             url,
-            sentPayload: { ...payload, message: `[${payload.message.length} chars]` },
             httpStatus: err.response?.status || null,
             mtnResponse: apiError
         });
