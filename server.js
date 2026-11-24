@@ -609,7 +609,7 @@ app.get('/', (req, res) => {
         provisionedMysqlFirms: provisionedFirmIds.size,
         watiChatbotWebhook: 'active',
         smsGateway: 'active (MTN Messaging SMS v3.0.0)',
-        version: '6.3.1-production',
+        version: '6.3.2-production',
         timestamp: new Date().toISOString()
     });
 });
