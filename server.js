@@ -314,6 +314,16 @@ function formatMsisdn(phone) {
     return digits;
 }
 
+function formatMtnAddress(rawAddress) {
+    const cleaned = String(rawAddress || '').trim();
+    if (!cleaned) return '';
+    const prefix = process.env.MTN_ADDRESS_PREFIX || '';
+    if (prefix && !cleaned.startsWith(prefix)) {
+        return `${prefix}${cleaned.replace(/^\+/, '')}`;
+    }
+    return cleaned;
+}
+
 function normalizePhone(phone) {
     return formatMsisdn(phone);
 }
@@ -440,8 +450,8 @@ async function getMtnAccessToken() {
 async function sendSmsApi(phone, message, lawyerId = null, options = {}) {
     const { force = false } = options;
     const formattedPhone = formatMsisdn(phone);
-    if (!formattedPhone) {
-        throw new Error('Valid recipient phone number is required.');
+    if (!formattedPhone || formattedPhone.length < 10) {
+        throw new Error('Valid recipient phone number is required (e.g. 27821234567).');
     }
     if (!message || !String(message).trim()) {
         throw new Error('SMS message text is required.');
@@ -454,7 +464,9 @@ async function sendSmsApi(phone, message, lawyerId = null, options = {}) {
     }
 
     const baseUrl = (process.env.MTN_BASE_URL || 'https://api.mtn.com/v1').replace(/\/+$/, '');
-    const senderAddress = String(process.env.MTN_SENDER_ADDRESS || '27715694131').trim();
+    const endpointPath = process.env.MTN_SMS_ENDPOINT || '/messages/sms/outbound';
+    const senderAddress = formatMtnAddress(process.env.MTN_SENDER_ADDRESS || '27715694131');
+    const receiverAddress = [formatMtnAddress(formattedPhone)];
     const transactionId = crypto.randomUUID();
     const clientCorrelator = `l3_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
 
@@ -462,8 +474,8 @@ async function sendSmsApi(phone, message, lawyerId = null, options = {}) {
 
     const payload = {
         senderAddress,
-        receiverAddress: [formattedPhone],
-        message: String(message),
+        receiverAddress,
+        message: String(message).trim(),
         clientCorrelator
     };
 
@@ -477,7 +489,7 @@ async function sendSmsApi(phone, message, lawyerId = null, options = {}) {
         'transactionId': transactionId
     };
 
-    const url = `${baseUrl}/messages/sms/outbound`;
+    const url = `${baseUrl}${endpointPath}`;
 
     try {
         const response = await axios.post(url, payload, {
@@ -491,14 +503,12 @@ async function sendSmsApi(phone, message, lawyerId = null, options = {}) {
             transactionId: response.data?.transactionId || transactionId
         };
     } catch (err) {
-        const apiError = err.response?.data || {};
-        console.error('[MTN SMS v3 ERROR]', {
+        const apiError = err.response?.data || { message: err.message };
+        console.error('[MTN SMS v3 ERROR DETAILS]:', {
+            url,
+            sentPayload: { ...payload, message: `[${payload.message.length} chars]` },
             httpStatus: err.response?.status || null,
-            statusCode: apiError.statusCode || null,
-            statusMessage: apiError.statusMessage || err.message,
-            supportMessage: apiError.supportMessage || null,
-            downstreamStatusCode: apiError.downstreamStatusCode || null,
-            transactionId: apiError.transactionId || transactionId
+            mtnResponse: apiError
         });
         throw err;
     }
@@ -590,7 +600,7 @@ app.get('/', (req, res) => {
         provisionedMysqlFirms: provisionedFirmIds.size,
         watiChatbotWebhook: 'active',
         smsGateway: 'active (MTN Messaging SMS v3.0.0)',
-        version: '6.3.0-production',
+        version: '6.3.1-production',
         timestamp: new Date().toISOString()
     });
 });
